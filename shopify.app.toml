@@ -1,6 +1,6 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "fc57d20375c1171de2b2b5c927ecffbf"
+client_id = "cc14985f94205e7c205044e1e2b7978c"
 name = "json-inspector"
 application_url = "https://json-inspector-app.terenzzzz.cn"
 embedded = true
