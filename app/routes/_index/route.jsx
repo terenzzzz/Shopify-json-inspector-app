@@ -48,6 +48,9 @@ export default function App() {
             its benefit to your customer.
           </li>
         </ul>
+        <p className={styles.text}>
+          <a href="/privacy">Privacy Policy</a>
+        </p>
       </div>
     </div>
   );
