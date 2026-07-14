@@ -1,0 +1,16 @@
+node_modules
+
+/.cache
+/build
+/.react-router
+/.shopify/dev-bundle
+
+.env
+.env.*
+!.env.example
+
+.DS_Store
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
