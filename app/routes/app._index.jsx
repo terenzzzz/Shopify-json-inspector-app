@@ -28,11 +28,9 @@ export default function Index() {
   const [selectedImages, setSelectedImages] = useState(new Set());
   const [selectedVideos, setSelectedVideos] = useState(new Set());
   const [selectedNode, setSelectedNode] = useState(null);
-  const [downloadState, setDownloadState] = useState({
-    loading: false,
-    progress: null,
-    result: "",
-  });
+  const [downloadState, setDownloadState] = useState(createEmptyDownloadState());
+  const [permanentFailedImages, setPermanentFailedImages] = useState(new Set());
+  const [excludedImages, setExcludedImages] = useState(new Set());
   const [originalPreviewSources, setOriginalPreviewSources] = useState({});
   const [originalPreviewLoading, setOriginalPreviewLoading] = useState(false);
   const [shopThemes, setShopThemes] = useState([]);
@@ -58,14 +56,21 @@ export default function Index() {
   const videos = inspection?.videos || [];
   const stats = inspection?.stats;
   const normalizedCdn = normalizeCdn(cdnPrefix);
+  const visibleImages = useMemo(
+    () => images.filter((name) => !excludedImages.has(name)),
+    [images, excludedImages],
+  );
   const selectedCount = selectedImages.size;
   const selectedVideoCount = selectedVideos.size;
   const defaultZipName = stripExt(sourceName || "shopify-images");
-  const selectedImageList = images.filter((name) => selectedImages.has(name));
   const selectedVideoList = videos.filter((name) => selectedVideos.has(name));
   const imageKey = images.join("\0");
   const videoKey = videos.join("\0");
   const mediaKey = `${imageKey}\n${videoKey}`;
+  const permanentFailedCount = useMemo(
+    () => visibleImages.filter((name) => permanentFailedImages.has(name)).length,
+    [visibleImages, permanentFailedImages],
+  );
 
   const loadThemeData = async (themeId, signal) => {
     setThemeTemplatesLoading(true);
@@ -154,6 +159,15 @@ export default function Index() {
     return () => controller.abort();
   }, [downloadMode, mediaKey]);
 
+  useEffect(() => {
+    setExcludedImages(new Set());
+    setPermanentFailedImages(new Set());
+  }, [imageKey]);
+
+  useEffect(() => {
+    setPermanentFailedImages(new Set());
+  }, [downloadMode, normalizedCdn]);
+
   const loadRawJson = (raw, filename) => {
     setRawJson(raw);
     setSourceName(filename);
@@ -161,7 +175,9 @@ export default function Index() {
     setSelectedVideos(new Set());
     setSelectedNode(null);
     setOriginalPreviewSources({});
-    setDownloadState({ loading: false, progress: null, result: "" });
+    setExcludedImages(new Set());
+    setPermanentFailedImages(new Set());
+    setDownloadState(createEmptyDownloadState());
   };
 
   const onThemeChange = async (event) => {
@@ -234,8 +250,75 @@ export default function Index() {
     setSelectedNode(null);
     setOriginalPreviewSources({});
     setOriginalPreviewLoading(false);
-    setDownloadState({ loading: false, progress: null, result: "" });
+    setExcludedImages(new Set());
+    setPermanentFailedImages(new Set());
+    setDownloadState(createEmptyDownloadState());
     if (fileInputRef.current) fileInputRef.current.value = "";
+    import("../utils/downloadImages.client").then(({ clearDownloadSession }) => {
+      clearDownloadSession();
+    });
+  };
+
+  const applyDownloadResult = (result, fallbackMessage) => {
+    const failedCount = result.failedNames?.length || result.failed?.length || 0;
+    const total = (result.success || 0) + failedCount;
+    const hasPermanent =
+      (result.unresolved?.length || 0) > 0 || permanentFailedCount > 0;
+    const message =
+      fallbackMessage ||
+      buildDownloadResultMessage(result, {
+        suggestPurge: hasPermanent,
+      });
+
+    if (result.unresolved?.length) {
+      setPermanentFailedImages((current) => {
+        const next = new Set(current);
+        for (const name of result.unresolved) next.add(name);
+        return next;
+      });
+    }
+
+    setDownloadState({
+      loading: false,
+      progress: {
+        done: total,
+        total,
+        failed: failedCount,
+      },
+      result: message,
+      canResume: Boolean(result.canResume),
+      failedNames: result.failedNames || result.failed || [],
+      unresolved: result.unresolved || [],
+      failureReasons: result.failureReasons || {},
+      partial: Boolean(result.partial),
+    });
+    shopify.toast.show(message, { isError: failedCount > 0 });
+  };
+
+  const markPermanentFailedImage = (name) => {
+    setPermanentFailedImages((current) => {
+      if (current.has(name)) return current;
+      const next = new Set(current);
+      next.add(name);
+      return next;
+    });
+  };
+
+  const purgePermanentFailedImages = () => {
+    if (!permanentFailedImages.size) return;
+
+    const removeSet = new Set(permanentFailedImages);
+    setExcludedImages((current) => new Set([...current, ...removeSet]));
+    setSelectedImages((current) => {
+      const next = new Set(current);
+      for (const name of removeSet) next.delete(name);
+      return next;
+    });
+    setPermanentFailedImages(new Set());
+    import("../utils/downloadImages.client").then(({ clearDownloadSession }) => {
+      clearDownloadSession();
+    });
+    shopify.toast.show(`已剔除 ${removeSet.size} 张永久失效图片`);
   };
 
   const toggleImage = (name) => {
@@ -245,46 +328,6 @@ export default function Index() {
       else next.add(name);
       return next;
     });
-  };
-
-  const downloadMedia = async (targetImages, targetVideos) => {
-    const videosToDownload = downloadMode === "original" ? targetVideos : [];
-    const imageCount = targetImages.length;
-    const videoCount = videosToDownload.length;
-
-    if (imageCount === 0 && videoCount === 0) {
-      shopify.toast.show("请先选择图片或视频", { isError: true });
-      return;
-    }
-
-    if (downloadMode === "cdn" && !normalizedCdn) {
-      shopify.toast.show("CDN 模式需要先填写 CDN 前缀", { isError: true });
-      return;
-    }
-
-    const total = imageCount + videoCount;
-    setDownloadState({ loading: true, progress: [0, total], result: "" });
-
-    try {
-      const { downloadMediaAsZip } = await import("../utils/downloadImages.client");
-      const result = await downloadMediaAsZip({
-        images: targetImages,
-        videos: videosToDownload,
-        cdnPrefix: normalizedCdn,
-        zipBaseName: zipName || defaultZipName,
-        mode: downloadMode,
-        onProgress: (done, progressTotal) => {
-          setDownloadState((state) => ({ ...state, progress: [done, progressTotal] }));
-        },
-      });
-
-      const message = buildDownloadResultMessage(result, imageCount, videoCount);
-      setDownloadState({ loading: false, progress: null, result: message });
-      shopify.toast.show(message, { isError: result.failed.length > 0 });
-    } catch (error) {
-      setDownloadState({ loading: false, progress: null, result: error.message });
-      shopify.toast.show(error.message, { isError: true });
-    }
   };
 
   const downloadImages = async (targetImages) => {
@@ -298,7 +341,11 @@ export default function Index() {
       return;
     }
 
-    setDownloadState({ loading: true, progress: [0, targetImages.length], result: "" });
+    setDownloadState({
+      ...createEmptyDownloadState(),
+      loading: true,
+      progress: { done: 0, total: targetImages.length },
+    });
 
     try {
       const { downloadImagesAsZip } = await import("../utils/downloadImages.client");
@@ -307,19 +354,25 @@ export default function Index() {
         cdnPrefix: normalizedCdn,
         zipBaseName: zipName || defaultZipName,
         mode: downloadMode,
-        onProgress: (done, total) => {
-          setDownloadState((state) => ({ ...state, progress: [done, total] }));
+        onProgress: (done, total, meta = {}) => {
+          setDownloadState((state) => ({
+            ...state,
+            progress: {
+              done,
+              total,
+              current: meta.current,
+              failed: meta.failed,
+            },
+          }));
         },
       });
 
-      const message =
-        result.failed.length > 0
-          ? `完成：成功 ${result.success} 个，失败 ${result.failed.length} 个`
-          : `完成：共 ${result.success} 张图片`;
-      setDownloadState({ loading: false, progress: null, result: message });
-      shopify.toast.show(message, { isError: result.failed.length > 0 });
+      applyDownloadResult(result);
     } catch (error) {
-      setDownloadState({ loading: false, progress: null, result: error.message });
+      setDownloadState({
+        ...createEmptyDownloadState(),
+        result: error.message,
+      });
       shopify.toast.show(error.message, { isError: true });
     }
   };
@@ -344,7 +397,11 @@ export default function Index() {
       return;
     }
 
-    setDownloadState({ loading: true, progress: [0, targetVideos.length], result: "" });
+    setDownloadState({
+      ...createEmptyDownloadState(),
+      loading: true,
+      progress: { done: 0, total: targetVideos.length },
+    });
 
     try {
       const { downloadVideosAsZip } = await import("../utils/downloadImages.client");
@@ -352,19 +409,70 @@ export default function Index() {
         videos: targetVideos,
         zipBaseName: zipName || defaultZipName,
         mode: downloadMode,
-        onProgress: (done, total) => {
-          setDownloadState((state) => ({ ...state, progress: [done, total] }));
+        onProgress: (done, total, meta = {}) => {
+          setDownloadState((state) => ({
+            ...state,
+            progress: {
+              done,
+              total,
+              current: meta.current,
+              failed: meta.failed,
+            },
+          }));
         },
       });
 
-      const message =
-        result.failed.length > 0
-          ? `完成：成功 ${result.success} 个，失败 ${result.failed.length} 个`
-          : `完成：共 ${result.success} 个视频`;
-      setDownloadState({ loading: false, progress: null, result: message });
-      shopify.toast.show(message, { isError: result.failed.length > 0 });
+      applyDownloadResult(result);
     } catch (error) {
-      setDownloadState({ loading: false, progress: null, result: error.message });
+      setDownloadState({
+        ...createEmptyDownloadState(),
+        result: error.message,
+      });
+      shopify.toast.show(error.message, { isError: true });
+    }
+  };
+
+  const resumeFailedDownload = async () => {
+    setDownloadState((state) => ({
+      ...state,
+      loading: true,
+      result: "",
+      progress: state.progress || { done: 0, total: state.failedNames.length || 0 },
+    }));
+
+    try {
+      const { resumeDownload } = await import("../utils/downloadImages.client");
+      const result = await resumeDownload({
+        onProgress: (done, total, meta = {}) => {
+          setDownloadState((state) => ({
+            ...state,
+            progress: {
+              done,
+              total,
+              current: meta.current,
+              failed: meta.failed,
+            },
+          }));
+        },
+      });
+
+      if (!result) {
+        setDownloadState((state) => ({
+          ...state,
+          loading: false,
+          canResume: false,
+          result: "没有可重试的失败项",
+        }));
+        return;
+      }
+
+      applyDownloadResult(result);
+    } catch (error) {
+      setDownloadState((state) => ({
+        ...state,
+        loading: false,
+        result: error.message,
+      }));
       shopify.toast.show(error.message, { isError: true });
     }
   };
@@ -483,37 +591,8 @@ export default function Index() {
                 onInput={(event) => setZipName(event.currentTarget.value)}
               ></s-text-field>
               <s-text color="subdued">
-                当前模板：{formatMediaCount(images.length, videos.length)}
+                当前模板：{formatMediaCount(images.length, videos.length)}。请在右侧图片/视频区下载。
               </s-text>
-              <div className="inspector-download-actions">
-                <s-button
-                  onClick={() => downloadMedia(selectedImageList, selectedVideoList)}
-                  disabled={
-                    (selectedCount === 0 && (downloadMode !== "original" || selectedVideoCount === 0)) ||
-                    downloadState.loading
-                  }
-                >
-                  下载选中 ({formatMediaCount(selectedCount, downloadMode === "original" ? selectedVideoCount : 0)})
-                </s-button>
-                <s-button
-                  variant="secondary"
-                  onClick={() => downloadMedia(images, videos)}
-                  disabled={
-                    (images.length === 0 && (downloadMode !== "original" || videos.length === 0)) ||
-                    downloadState.loading
-                  }
-                >
-                  下载全部 ZIP ({formatMediaCount(images.length, downloadMode === "original" ? videos.length : 0)})
-                </s-button>
-              </div>
-              {downloadState.progress && (
-                <s-box padding="small" borderRadius="base" background="subdued">
-                  <s-text>
-                    下载中：{downloadState.progress[0]} / {downloadState.progress[1]}
-                  </s-text>
-                </s-box>
-              )}
-              {downloadState.result && <s-text>{downloadState.result}</s-text>}
             </s-stack>
           </s-section>
         </s-stack>
@@ -528,21 +607,27 @@ export default function Index() {
           {stats && <StatsCard stats={stats} />}
           {images && (
             <ImagesCard
-              images={images}
+              images={visibleImages}
               cdnPrefix={normalizedCdn}
               downloadMode={downloadMode}
               originalPreviewSources={originalPreviewSources}
               originalPreviewLoading={originalPreviewLoading}
               selectedImages={selectedImages}
               selectedCount={selectedCount}
+              permanentFailedImages={permanentFailedImages}
+              permanentFailedCount={permanentFailedCount}
               downloading={downloadState.loading}
+              downloadState={downloadState}
               onToggle={toggleImage}
-              onSelectAll={() => setSelectedImages(new Set(images))}
+              onSelectAll={() => setSelectedImages(new Set(visibleImages))}
               onClearSelection={() => setSelectedImages(new Set())}
-              onDownloadAll={() => downloadImages(images)}
+              onMarkFailed={markPermanentFailedImage}
+              onPurgeFailed={purgePermanentFailedImages}
+              onDownloadAll={() => downloadImages(visibleImages)}
               onDownloadSelected={() =>
-                downloadImages(images.filter((name) => selectedImages.has(name)))
+                downloadImages(visibleImages.filter((name) => selectedImages.has(name)))
               }
+              onResume={resumeFailedDownload}
             />
           )}
           {videos && (
@@ -554,12 +639,15 @@ export default function Index() {
               selectedVideos={selectedVideos}
               selectedCount={selectedVideoCount}
               downloading={downloadState.loading}
+              downloadState={downloadState}
+              showDownloadProgress={images.length === 0}
               shopify={shopify}
               onToggle={toggleVideo}
               onSelectAll={() => setSelectedVideos(new Set(videos))}
               onClearSelection={() => setSelectedVideos(new Set())}
               onDownloadAll={() => downloadVideos(videos)}
               onDownloadSelected={() => downloadVideos(selectedVideoList)}
+              onResume={resumeFailedDownload}
             />
           )}
           {inspection?.tree && (
@@ -688,12 +776,18 @@ function ImagesCard({
   originalPreviewLoading,
   selectedImages,
   selectedCount,
+  permanentFailedImages,
+  permanentFailedCount,
   downloading,
+  downloadState,
   onToggle,
   onSelectAll,
   onClearSelection,
+  onMarkFailed,
+  onPurgeFailed,
   onDownloadAll,
   onDownloadSelected,
+  onResume,
 }) {
   const [imageSizes, setImageSizes] = useState({});
   const imageKey = images.join("\0");
@@ -720,7 +814,7 @@ function ImagesCard({
     if (downloadMode === "cdn" && cdnPrefix) {
       const controller = new AbortController();
 
-      async function loadSizes() {
+      const loadSizes = async () => {
         try {
           const { fetchDownloadImageSize } = await import("../utils/downloadImages.client");
           const entries = await Promise.all(
@@ -742,7 +836,7 @@ function ImagesCard({
             setImageSizes({});
           }
         }
-      }
+      };
 
       loadSizes();
       return () => controller.abort();
@@ -771,6 +865,7 @@ function ImagesCard({
           <div className="image-grid">
             {images.map((name) => {
               const selected = selectedImages.has(name);
+              const failed = permanentFailedImages.has(name);
               const originalSrc = originalPreviewSources?.[name]?.url || "";
               const cdnSrc = cdnPrefix ? `${cdnPrefix}${encodePath(name)}` : "";
               const src = downloadMode === "original" ? originalSrc || cdnSrc : cdnSrc;
@@ -787,11 +882,25 @@ function ImagesCard({
                 <button
                   type="button"
                   key={name}
-                  className={`image-card ${selected ? "is-selected" : ""} ${isLarge ? "is-large" : ""}`}
+                  title={failed ? "永久失效（404/未找到）" : undefined}
+                  className={`image-card ${selected ? "is-selected" : ""} ${isLarge ? "is-large" : ""} ${failed ? "is-missing" : ""}`}
                   onClick={() => onToggle(name)}
                 >
                   <span className="image-preview">
-                    {src ? <img src={src} alt={name} loading="lazy" /> : <span>{emptyPreviewText}</span>}
+                    {src ? (
+                      <img
+                        src={src}
+                        alt={name}
+                        loading="lazy"
+                        onError={(event) => {
+                          event.currentTarget.style.display = "none";
+                          onMarkFailed(name);
+                        }}
+                      />
+                    ) : (
+                      <span>{emptyPreviewText}</span>
+                    )}
+                    {failed ? <span className="image-missing-badge">失效</span> : null}
                   </span>
                   <span className="image-name">{name}</span>
                   {(isNonWebp || isLarge) && (
@@ -821,7 +930,18 @@ function ImagesCard({
             <s-button variant="secondary" onClick={onDownloadAll} disabled={downloading}>
               下载全部 ZIP
             </s-button>
+            {downloadState?.canResume && (
+              <s-button variant="secondary" onClick={onResume} disabled={downloading}>
+                恢复下载
+              </s-button>
+            )}
+            {permanentFailedCount > 0 && (
+              <s-button variant="secondary" onClick={onPurgeFailed} disabled={downloading}>
+                剔除永久失效 ({permanentFailedCount})
+              </s-button>
+            )}
           </div>
+          <DownloadProgressPanel downloadState={downloadState} />
         </s-stack>
       )}
     </s-section>
@@ -836,12 +956,15 @@ function VideosCard({
   selectedVideos,
   selectedCount,
   downloading,
+  downloadState,
+  showDownloadProgress = false,
   shopify,
   onToggle,
   onSelectAll,
   onClearSelection,
   onDownloadAll,
   onDownloadSelected,
+  onResume,
 }) {
   const copyName = async (rawName) => {
     const name = videoDisplayName(rawName);
@@ -926,11 +1049,78 @@ function VideosCard({
               <s-button variant="secondary" onClick={onDownloadAll} disabled={downloading}>
                 下载全部 ZIP ({videos.length})
               </s-button>
+              {downloadState?.canResume && (
+                <s-button variant="secondary" onClick={onResume} disabled={downloading}>
+                  恢复下载
+                </s-button>
+              )}
             </div>
           )}
+          {showDownloadProgress && <DownloadProgressPanel downloadState={downloadState} />}
         </s-stack>
       )}
     </s-section>
+  );
+}
+
+function DownloadProgressPanel({ downloadState }) {
+  if (!downloadState) return null;
+
+  const visible =
+    downloadState.loading ||
+    Boolean(downloadState.result) ||
+    (downloadState.failedNames?.length || 0) > 0;
+
+  if (!visible) return null;
+
+  const progress = downloadState.progress;
+  const percent =
+    progress?.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+  const progressLabel = progress
+    ? [
+        `进度：${progress.done} / ${progress.total}`,
+        progress.current || null,
+        progress.failed > 0 ? `失败 ${progress.failed}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "进度：0 / 0";
+
+  return (
+    <div className="progress-wrapper">
+      <div className="progress-info">
+        <span className="progress-text">{progressLabel}</span>
+        {downloadState.result ? (
+          <span
+            className={
+              downloadState.failedNames.length > 0 ? "error-text" : "success-text"
+            }
+          >
+            {downloadState.result}
+          </span>
+        ) : null}
+      </div>
+      <div className="progress-track">
+        <div className="progress-bar" style={{ width: `${percent}%` }} />
+      </div>
+      {downloadState.failedNames.length > 0 ? (
+        <ul className="download-failed-list">
+          {downloadState.failedNames.map((name) => {
+            const permanent = downloadState.unresolved.includes(name);
+            const reason =
+              downloadState.failureReasons[name] ||
+              (permanent ? "未找到" : "下载失败");
+            return (
+              <li key={name}>
+                <code>{name}</code>
+                <span className="fail-tag">{permanent ? "永久" : "可重试"}</span>
+                <span className="fail-reason">{reason}</span>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
   );
 }
 
@@ -1019,16 +1209,52 @@ function formatMediaCount(imageCount, videoCount) {
   return parts.length > 0 ? parts.join(" / ") : "0";
 }
 
-function buildDownloadResultMessage(result, imageCount, videoCount) {
-  const requested = [];
-  if (imageCount > 0) requested.push(`${imageCount} 图`);
-  if (videoCount > 0) requested.push(`${videoCount} 视频`);
+function createEmptyDownloadState() {
+  return {
+    loading: false,
+    progress: null,
+    result: "",
+    canResume: false,
+    failedNames: [],
+    unresolved: [],
+    failureReasons: {},
+    partial: false,
+  };
+}
 
-  if (result.failed.length > 0) {
-    return `完成：成功 ${result.success} 个，失败 ${result.failed.length} 个（${requested.join(" / ")}）`;
+function buildDownloadResultMessage(result, options = {}) {
+  const { imageCount, videoCount, suggestPurge = false } = options;
+  const parts = [];
+
+  if ((result.failed?.length || 0) > 0) {
+    parts.push(`完成：成功 ${result.success} 个，失败 ${result.failed.length} 个`);
+    if (result.partial) {
+      parts.push("已导出含成功项的 ZIP（含 _failed.txt）");
+    } else if (result.success === 0) {
+      parts.push("无成功项，未生成 ZIP");
+    }
+    if (result.canResume) {
+      parts.push("可点击「恢复下载」重试可恢复项");
+    }
+    if (suggestPurge || result.unresolved?.length) {
+      parts.push("可点击「剔除永久失效」从列表移除");
+    }
+  } else {
+    parts.push(`完成：共 ${result.success} 个文件`);
   }
 
-  return `完成：共 ${result.success} 个文件（${requested.join(" / ")}）`;
+  if (imageCount != null || videoCount != null) {
+    const requested = [];
+    if (imageCount > 0) requested.push(`${imageCount} 图`);
+    if (videoCount > 0) requested.push(`${videoCount} 视频`);
+    if (requested.length) parts.push(`（${requested.join(" / ")}）`);
+  }
+
+  if (result.unresolved?.length) {
+    parts.push(`永久失败（404/未找到）：${result.unresolved.length} 个`);
+  }
+
+  return parts.join(" ");
 }
 
 function formatThemeOptionLabel(theme) {

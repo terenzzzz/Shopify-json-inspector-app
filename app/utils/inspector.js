@@ -142,7 +142,10 @@ export function parseTemplateTree(templateJson, filename = "template.json") {
 }
 
 export function normalizeCdn(prefix) {
-  let value = String(prefix || "").trim().replace(/\/+$/, "");
+  let value = String(prefix || "")
+    .trim()
+    .replace(/^http:\/\//i, "https://")
+    .replace(/\/+$/, "");
   if (!value) return "";
   if (!value.endsWith("/files")) value += "/files";
   return `${value}/`;

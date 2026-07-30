@@ -146,6 +146,7 @@
 }
 
 .image-preview {
+  position: relative;
   display: grid;
   place-items: center;
   aspect-ratio: 1;
@@ -160,6 +161,28 @@
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+
+.image-card.is-missing:not(.is-selected) {
+  border-color: #94a3b8;
+  background: #f8fafc;
+}
+
+.image-card.is-missing .image-preview {
+  background: #e2e8f0;
+}
+
+.image-missing-badge {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #64748b;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
 }
 
 .image-name,
@@ -213,6 +236,103 @@
   color: #c5280c;
   font-size: 11px;
   font-weight: 650;
+}
+
+.progress-wrapper {
+  margin-top: 8px;
+  padding: 12px;
+  border: 1px solid #e1e5ea;
+  border-radius: 10px;
+  background: #fafbfb;
+}
+
+.progress-info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  margin-bottom: 10px;
+  color: #616a75;
+}
+
+.progress-text {
+  color: #616a75;
+  word-break: break-all;
+}
+
+.progress-info .error-text,
+.progress-info .success-text {
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.progress-info .error-text {
+  color: #ef4444;
+}
+
+.progress-info .success-text {
+  color: #10b981;
+}
+
+.progress-track {
+  height: 6px;
+  background: #e1e5ea;
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: #005bd3;
+  width: 0%;
+  transition: width 0.2s;
+}
+
+.download-failed-list {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  list-style: none;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid #e1e5ea;
+  border-radius: 8px;
+  background: #fff;
+  font-size: 12px;
+  color: #616a75;
+}
+
+.download-failed-list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+  padding: 4px 0;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.download-failed-list li:last-child {
+  border-bottom: none;
+}
+
+.download-failed-list code {
+  color: #202223;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.download-failed-list .fail-tag {
+  flex: none;
+  font-size: 10px;
+  color: #b45309;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 4px;
+  padding: 0 5px;
+  line-height: 1.6;
+}
+
+.download-failed-list .fail-reason {
+  color: #94a3b8;
 }
 
 .video-icon {
