@@ -141,14 +141,36 @@ export function parseTemplateTree(templateJson, filename = "template.json") {
   };
 }
 
-export function normalizeCdn(prefix) {
-  let value = String(prefix || "")
-    .trim()
-    .replace(/^http:\/\//i, "https://")
-    .replace(/\/+$/, "");
+/**
+ * 从店铺域名或完整 CDN URL 提取 hostname。
+ * 例如 uk.shokz.com / https://uk.shokz.com/cdn/shop/files/ → uk.shokz.com
+ */
+export function extractCdnDomain(input) {
+  let value = String(input || "").trim();
   if (!value) return "";
-  if (!value.endsWith("/files")) value += "/files";
-  return `${value}/`;
+
+  value = value.replace(/^http:\/\//i, "https://");
+
+  try {
+    const url = /^https?:\/\//i.test(value)
+      ? new URL(value)
+      : new URL(`https://${value.replace(/^\/+/, "")}`);
+    const host = url.hostname.trim().toLowerCase();
+    if (!host || !host.includes(".")) return "";
+    return host;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 将店铺域名自动转换为 CDN 前缀：
+ * uk.shokz.com → https://uk.shokz.com/cdn/shop/files/
+ */
+export function normalizeCdn(input) {
+  const host = extractCdnDomain(input);
+  if (!host) return "";
+  return `https://${host}/cdn/shop/files/`;
 }
 
 export function normalizeImageName(rawName) {

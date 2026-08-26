@@ -17,7 +17,7 @@ export const meta = () => [
 export default function PrivacyPolicy() {
   const lastUpdated = "July 14, 2026";
   const appName = "JSON Inspector";
-  const contactEmail = "privacy@terenzzzz.cn";
+  const contactEmail = "terence5925@gmail.com";
 
   return (
     <main
@@ -31,9 +31,6 @@ export default function PrivacyPolicy() {
         color: "#1a1a1a",
       }}
     >
-      <p style={{ margin: 0, fontSize: "0.875rem", color: "#666" }}>
-        Draft — replace contact details and have counsel review before submission.
-      </p>
       <h1 style={{ marginTop: "0.75rem", fontSize: "1.75rem" }}>
         Privacy Policy
       </h1>

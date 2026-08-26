@@ -3,12 +3,16 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import {
+  extractCdnDomain,
   inspectTemplate,
   normalizeCdn,
   parseTemplateJson,
   stripExt,
 } from "../utils/inspector";
 import styles from "../styles/inspector.css?url";
+
+const CDN_DOMAIN_HISTORY_KEY = "shopify-json-inspector:cdn-domains";
+const MAX_CDN_DOMAIN_HISTORY = 8;
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
@@ -22,7 +26,8 @@ export default function Index() {
   const fileInputRef = useRef(null);
   const [rawJson, setRawJson] = useState("");
   const [sourceName, setSourceName] = useState("");
-  const [cdnPrefix, setCdnPrefix] = useState("");
+  const [cdnDomain, setCdnDomain] = useState("");
+  const [cdnDomainHistory, setCdnDomainHistory] = useState([]);
   const [zipName, setZipName] = useState("");
   const [downloadMode, setDownloadMode] = useState("original");
   const [selectedImages, setSelectedImages] = useState(new Set());
@@ -55,7 +60,7 @@ export default function Index() {
   const images = inspection?.images || [];
   const videos = inspection?.videos || [];
   const stats = inspection?.stats;
-  const normalizedCdn = normalizeCdn(cdnPrefix);
+  const normalizedCdn = normalizeCdn(cdnDomain);
   const visibleImages = useMemo(
     () => images.filter((name) => !excludedImages.has(name)),
     [images, excludedImages],
@@ -113,6 +118,10 @@ export default function Index() {
     const controller = new AbortController();
     loadThemeData("", controller.signal);
     return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    setCdnDomainHistory(loadCdnDomainHistory());
   }, []);
 
   useEffect(() => {
@@ -238,11 +247,19 @@ export default function Index() {
     setSelectedThemeTemplate("");
   };
 
+  const rememberCdnDomain = (value = cdnDomain) => {
+    const domain = extractCdnDomain(value);
+    if (!domain) return "";
+    setCdnDomain(domain);
+    setCdnDomainHistory(saveCdnDomainHistory(domain));
+    return domain;
+  };
+
   const clearAll = () => {
     setRawJson("");
     setSourceName("");
     setSelectedThemeTemplate("");
-    setCdnPrefix("");
+    setCdnDomain("");
     setZipName("");
     setDownloadMode("original");
     setSelectedImages(new Set());
@@ -257,6 +274,7 @@ export default function Index() {
     import("../utils/downloadImages.client").then(({ clearDownloadSession }) => {
       clearDownloadSession();
     });
+    shopify.toast.show("已重置输入和下载设置");
   };
 
   const applyDownloadResult = (result, fallbackMessage) => {
@@ -330,41 +348,59 @@ export default function Index() {
     });
   };
 
+  const applyDownloadProgress = (done, total, meta = {}) => {
+    setDownloadState((state) => ({
+      ...state,
+      loading: true,
+      progress: {
+        done,
+        total,
+        current: meta.current,
+        phase: meta.phase,
+        failed: meta.failed,
+      },
+      failedNames: Array.isArray(meta.failedNames) ? meta.failedNames : state.failedNames,
+      unresolved: Array.isArray(meta.unresolvedNames)
+        ? meta.unresolvedNames
+        : state.unresolved,
+      failureReasons:
+        meta.failureReasons && typeof meta.failureReasons === "object"
+          ? meta.failureReasons
+          : state.failureReasons,
+    }));
+  };
+
   const downloadImages = async (targetImages) => {
     if (!targetImages.length) {
       shopify.toast.show("请先选择图片", { isError: true });
       return;
     }
 
-    if (downloadMode === "cdn" && !normalizedCdn) {
-      shopify.toast.show("CDN 模式需要先填写 CDN 前缀", { isError: true });
-      return;
+    let cdnPrefixForDownload = "";
+    if (downloadMode === "cdn") {
+      const domain = rememberCdnDomain();
+      if (!domain) {
+        shopify.toast.show("CDN 模式需要先填写店铺域名", { isError: true });
+        return;
+      }
+      cdnPrefixForDownload = normalizeCdn(domain);
     }
 
     setDownloadState({
       ...createEmptyDownloadState(),
       loading: true,
-      progress: { done: 0, total: targetImages.length },
+      progress: { done: 0, total: targetImages.length, phase: downloadMode === "original" ? "resolve" : "download" },
     });
 
     try {
       const { downloadImagesAsZip } = await import("../utils/downloadImages.client");
       const result = await downloadImagesAsZip({
         images: targetImages,
-        cdnPrefix: normalizedCdn,
+        cdnPrefix: cdnPrefixForDownload,
         zipBaseName: zipName || defaultZipName,
         mode: downloadMode,
-        onProgress: (done, total, meta = {}) => {
-          setDownloadState((state) => ({
-            ...state,
-            progress: {
-              done,
-              total,
-              current: meta.current,
-              failed: meta.failed,
-            },
-          }));
-        },
+        originalSources: downloadMode === "original" ? originalPreviewSources : undefined,
+        onProgress: applyDownloadProgress,
       });
 
       applyDownloadResult(result);
@@ -400,7 +436,7 @@ export default function Index() {
     setDownloadState({
       ...createEmptyDownloadState(),
       loading: true,
-      progress: { done: 0, total: targetVideos.length },
+      progress: { done: 0, total: targetVideos.length, phase: "resolve" },
     });
 
     try {
@@ -409,17 +445,8 @@ export default function Index() {
         videos: targetVideos,
         zipBaseName: zipName || defaultZipName,
         mode: downloadMode,
-        onProgress: (done, total, meta = {}) => {
-          setDownloadState((state) => ({
-            ...state,
-            progress: {
-              done,
-              total,
-              current: meta.current,
-              failed: meta.failed,
-            },
-          }));
-        },
+        originalSources: originalPreviewSources,
+        onProgress: applyDownloadProgress,
       });
 
       applyDownloadResult(result);
@@ -437,23 +464,13 @@ export default function Index() {
       ...state,
       loading: true,
       result: "",
-      progress: state.progress || { done: 0, total: state.failedNames.length || 0 },
+      progress: state.progress || { done: 0, total: state.failedNames.length || 0, phase: "download" },
     }));
 
     try {
       const { resumeDownload } = await import("../utils/downloadImages.client");
       const result = await resumeDownload({
-        onProgress: (done, total, meta = {}) => {
-          setDownloadState((state) => ({
-            ...state,
-            progress: {
-              done,
-              total,
-              current: meta.current,
-              failed: meta.failed,
-            },
-          }));
-        },
+        onProgress: applyDownloadProgress,
       });
 
       if (!result) {
@@ -485,8 +502,18 @@ export default function Index() {
 
       <s-grid gridTemplateColumns="minmax(320px, 420px) 1fr" gap="base" alignItems="start">
         <s-stack direction="block" gap="base">
-          <s-section heading="输入">
+          <s-section accessibilityLabel="输入">
             <s-stack direction="block" gap="base">
+              <div className="inspector-input-header">
+                <s-heading>输入</s-heading>
+                <s-button
+                  variant="secondary"
+                  onClick={clearAll}
+                  disabled={downloadState.loading}
+                >
+                  重置
+                </s-button>
+              </div>
               <s-select
                 label="选择主题"
                 value={selectedThemeId}
@@ -571,18 +598,45 @@ export default function Index() {
                 onInput={(event) => setDownloadMode(event.currentTarget.value)}
               >
                 <s-option value="original">原图模式（App 授权 Admin API，无需 CDN）</s-option>
-                <s-option value="cdn">CDN 模式（需要 CDN 前缀）</s-option>
+                <s-option value="cdn">CDN 模式（填写店铺域名即可）</s-option>
               </s-select>
               {downloadMode === "original" && (
                 <s-text color="subdued">原图模式仅可解析并下载当前店铺内的图片与视频资源。</s-text>
               )}
               {downloadMode === "cdn" && (
-                <s-url-field
-                  label="CDN 前缀"
-                  placeholder="https://uk.shokz.com/cdn/shop/files/"
-                  value={cdnPrefix}
-                  onInput={(event) => setCdnPrefix(event.currentTarget.value)}
-                ></s-url-field>
+                <s-stack direction="block" gap="small-200">
+                  <s-text-field
+                    label="店铺域名"
+                    placeholder="uk.shokz.com"
+                    value={cdnDomain}
+                    onInput={(event) => setCdnDomain(event.currentTarget.value)}
+                    onBlur={() => rememberCdnDomain()}
+                  ></s-text-field>
+                  {normalizedCdn ? (
+                    <s-text color="subdued">自动 CDN 前缀：{normalizedCdn}</s-text>
+                  ) : (
+                    <s-text color="subdued">
+                      输入店铺域名后自动转换为 https://域名/cdn/shop/files/
+                    </s-text>
+                  )}
+                  {cdnDomainHistory.length > 0 && (
+                    <div className="cdn-domain-history">
+                      <div className="cdn-domain-history-label">历史域名</div>
+                      <div className="cdn-domain-history-list">
+                        {cdnDomainHistory.map((domain) => (
+                          <button
+                            type="button"
+                            key={domain}
+                            className={`cdn-domain-chip${cdnDomain === domain ? " is-active" : ""}`}
+                            onClick={() => rememberCdnDomain(domain)}
+                          >
+                            {domain}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </s-stack>
               )}
               <s-text-field
                 label="导出 ZIP 名称"
@@ -640,7 +694,6 @@ export default function Index() {
               selectedCount={selectedVideoCount}
               downloading={downloadState.loading}
               downloadState={downloadState}
-              showDownloadProgress={images.length === 0}
               shopify={shopify}
               onToggle={toggleVideo}
               onSelectAll={() => setSelectedVideos(new Set(videos))}
@@ -650,6 +703,7 @@ export default function Index() {
               onResume={resumeFailedDownload}
             />
           )}
+          <DownloadProgressPanel downloadState={downloadState} />
           {inspection?.tree && (
             <StructureCard
               tree={inspection.tree}
@@ -659,30 +713,6 @@ export default function Index() {
           )}
         </s-stack>
       </s-grid>
-
-      <s-box slot="aside" padding="base" className="inspector-aside">
-        <s-stack direction="block" gap="base">
-          <s-section heading="App 信息">
-            <s-paragraph>
-              <s-text>模式：嵌入式 Shopify Admin App</s-text>
-            </s-paragraph>
-            <s-paragraph>
-              <s-text>UI：Polaris web components</s-text>
-            </s-paragraph>
-            <s-paragraph>
-              <s-text>权限：read_files、read_themes</s-text>
-            </s-paragraph>
-          </s-section>
-
-          <s-section heading="使用建议">
-            <s-unordered-list>
-              <s-list-item>CDN 模式适合预览和轻量下载。</s-list-item>
-              <s-list-item>原图模式适合迁移资源，文件 URL 由后端安全解析。</s-list-item>
-              <s-list-item>可在已发布、开发中或未发布主题之间切换并选择 templates/ JSON。</s-list-item>
-            </s-unordered-list>
-          </s-section>
-        </s-stack>
-      </s-box>
     </s-page>
   );
 }
@@ -877,7 +907,7 @@ function ImagesCard({
                   ? originalPreviewLoading
                     ? "解析原图中"
                     : "未匹配原图"
-                  : "需配置 CDN";
+                  : "需填写域名";
               return (
                 <button
                   type="button"
@@ -941,7 +971,6 @@ function ImagesCard({
               </s-button>
             )}
           </div>
-          <DownloadProgressPanel downloadState={downloadState} />
         </s-stack>
       )}
     </s-section>
@@ -957,7 +986,6 @@ function VideosCard({
   selectedCount,
   downloading,
   downloadState,
-  showDownloadProgress = false,
   shopify,
   onToggle,
   onSelectAll,
@@ -1056,7 +1084,6 @@ function VideosCard({
               )}
             </div>
           )}
-          {showDownloadProgress && <DownloadProgressPanel downloadState={downloadState} />}
         </s-stack>
       )}
     </s-section>
@@ -1076,8 +1103,15 @@ function DownloadProgressPanel({ downloadState }) {
   const progress = downloadState.progress;
   const percent =
     progress?.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+  const phaseLabel =
+    progress?.phase === "resolve"
+      ? "解析原图"
+      : progress?.phase === "download"
+        ? "下载文件"
+        : null;
   const progressLabel = progress
     ? [
+        phaseLabel,
         `进度：${progress.done} / ${progress.total}`,
         progress.current || null,
         progress.failed > 0 ? `失败 ${progress.failed}` : null,
@@ -1087,40 +1121,42 @@ function DownloadProgressPanel({ downloadState }) {
     : "进度：0 / 0";
 
   return (
-    <div className="progress-wrapper">
-      <div className="progress-info">
-        <span className="progress-text">{progressLabel}</span>
-        {downloadState.result ? (
-          <span
-            className={
-              downloadState.failedNames.length > 0 ? "error-text" : "success-text"
-            }
-          >
-            {downloadState.result}
-          </span>
+    <s-section heading="下载进度">
+      <div className="progress-wrapper">
+        <div className="progress-info">
+          <span className="progress-text">{progressLabel}</span>
+          {downloadState.result ? (
+            <span
+              className={
+                downloadState.failedNames.length > 0 ? "error-text" : "success-text"
+              }
+            >
+              {downloadState.result}
+            </span>
+          ) : null}
+        </div>
+        <div className="progress-track">
+          <div className="progress-bar" style={{ width: `${percent}%` }} />
+        </div>
+        {downloadState.failedNames.length > 0 ? (
+          <ul className="download-failed-list">
+            {downloadState.failedNames.map((name) => {
+              const permanent = downloadState.unresolved.includes(name);
+              const reason =
+                downloadState.failureReasons[name] ||
+                (permanent ? "未找到" : "下载失败");
+              return (
+                <li key={name}>
+                  <code>{name}</code>
+                  <span className="fail-tag">{permanent ? "永久" : "可重试"}</span>
+                  <span className="fail-reason">{reason}</span>
+                </li>
+              );
+            })}
+          </ul>
         ) : null}
       </div>
-      <div className="progress-track">
-        <div className="progress-bar" style={{ width: `${percent}%` }} />
-      </div>
-      {downloadState.failedNames.length > 0 ? (
-        <ul className="download-failed-list">
-          {downloadState.failedNames.map((name) => {
-            const permanent = downloadState.unresolved.includes(name);
-            const reason =
-              downloadState.failureReasons[name] ||
-              (permanent ? "未找到" : "下载失败");
-            return (
-              <li key={name}>
-                <code>{name}</code>
-                <span className="fail-tag">{permanent ? "永久" : "可重试"}</span>
-                <span className="fail-reason">{reason}</span>
-              </li>
-            );
-          })}
-        </ul>
-      ) : null}
-    </div>
+    </s-section>
   );
 }
 
@@ -1220,6 +1256,41 @@ function createEmptyDownloadState() {
     failureReasons: {},
     partial: false,
   };
+}
+
+function loadCdnDomainHistory() {
+  if (typeof localStorage === "undefined") return [];
+
+  try {
+    const raw = localStorage.getItem(CDN_DOMAIN_HISTORY_KEY);
+    const list = JSON.parse(raw || "[]");
+    if (!Array.isArray(list)) return [];
+    return list
+      .map((item) => extractCdnDomain(item))
+      .filter(Boolean)
+      .filter((domain, index, all) => all.indexOf(domain) === index)
+      .slice(0, MAX_CDN_DOMAIN_HISTORY);
+  } catch {
+    return [];
+  }
+}
+
+function saveCdnDomainHistory(domain) {
+  const host = extractCdnDomain(domain);
+  if (!host) return loadCdnDomainHistory();
+
+  const next = [host, ...loadCdnDomainHistory().filter((item) => item !== host)].slice(
+    0,
+    MAX_CDN_DOMAIN_HISTORY,
+  );
+
+  try {
+    localStorage.setItem(CDN_DOMAIN_HISTORY_KEY, JSON.stringify(next));
+  } catch {
+    // ignore quota / private mode failures
+  }
+
+  return next;
 }
 
 function buildDownloadResultMessage(result, options = {}) {

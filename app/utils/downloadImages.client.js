@@ -77,6 +77,7 @@ export async function downloadImagesAsZip({
   zipBaseName,
   mode,
   onProgress,
+  originalSources,
 }) {
   clearDownloadSession();
   currentDownloadSession = createDownloadSession({
@@ -86,6 +87,7 @@ export async function downloadImagesAsZip({
     zipBaseName,
     mode,
     zipSuffix: "",
+    originalSources,
   });
   return runDownloadSession(currentDownloadSession, onProgress);
 }
@@ -97,6 +99,7 @@ export async function downloadMediaAsZip({
   zipBaseName,
   mode,
   onProgress,
+  originalSources,
 }) {
   clearDownloadSession();
   currentDownloadSession = createDownloadSession({
@@ -106,6 +109,7 @@ export async function downloadMediaAsZip({
     zipBaseName,
     mode,
     zipSuffix: "",
+    originalSources,
   });
   return runDownloadSession(currentDownloadSession, onProgress);
 }
@@ -115,6 +119,7 @@ export async function downloadVideosAsZip({
   zipBaseName,
   mode,
   onProgress,
+  originalSources,
 }) {
   if (mode !== "original") {
     throw new Error("视频下载目前仅支持原图模式");
@@ -128,6 +133,7 @@ export async function downloadVideosAsZip({
     zipBaseName,
     mode,
     zipSuffix: "-videos",
+    originalSources,
   });
   return runDownloadSession(currentDownloadSession, onProgress);
 }
@@ -155,7 +161,15 @@ export function buildDownloadUrl(cdnPrefix, name) {
   return `${baseUrl}?${params.toString()}`;
 }
 
-function createDownloadSession({ images, videos, cdnPrefix, zipBaseName, mode, zipSuffix }) {
+function createDownloadSession({
+  images,
+  videos,
+  cdnPrefix,
+  zipBaseName,
+  mode,
+  zipSuffix,
+  originalSources,
+}) {
   const normalizedImages = images.map(normalizeImageName).filter(Boolean);
   const normalizedVideos =
     mode === "original" ? videos.map(normalizeVideoName).filter(Boolean) : [];
@@ -178,30 +192,60 @@ function createDownloadSession({ images, videos, cdnPrefix, zipBaseName, mode, z
     zipSuffix: zipSuffix || "",
     completed: new Map(),
     pending: [...kindByName.keys()],
-    originalSources: new Map(),
+    originalSources: seedOriginalSources(originalSources),
     unresolved: [],
     failureReasons: new Map(),
     kindByName,
   };
 }
 
+function seedOriginalSources(sources) {
+  const map = new Map();
+  if (!sources) return map;
+
+  const entries =
+    sources instanceof Map
+      ? sources.entries()
+      : Object.entries(sources || {});
+
+  for (const [rawName, source] of entries) {
+    const name = normalizeMediaName(rawName);
+    if (!name || !source) continue;
+    map.set(name, source);
+  }
+
+  return map;
+}
+
 async function runDownloadSession(session, onProgress) {
+  const total = session.images.length + session.videos.length;
+  const emitProgress = (done, meta = {}) => {
+    const failedNames = session.pending.filter(
+      (name) => session.failureReasons.has(name) || session.unresolved.includes(name),
+    );
+    onProgress?.(done, total, {
+      current: meta.current,
+      phase: meta.phase || "download",
+      failed: failedNames.length,
+      unresolved: session.unresolved.length,
+      failedNames,
+      unresolvedNames: [...session.unresolved],
+      failureReasons: Object.fromEntries(session.failureReasons),
+    });
+  };
+
   if (session.mode === "original") {
-    await resolvePendingOriginalSources(session, onProgress);
+    await resolvePendingOriginalSources(session, emitProgress);
   } else if (!normalizeCdn(session.cdnPrefix)) {
-    throw new Error("请先填写 CDN 前缀");
+    throw new Error("请先填写店铺域名");
   }
 
   const retryablePending = session.pending.filter(
     (name) => !session.unresolved.includes(name),
   );
-  const total = session.images.length + session.videos.length;
   let finished = total - retryablePending.length;
 
-  onProgress?.(finished, total, {
-    failed: session.pending.length,
-    unresolved: session.unresolved.length,
-  });
+  emitProgress(finished, { phase: "download" });
 
   await mapPool(retryablePending, DOWNLOAD_CONCURRENCY, async (name) => {
     try {
@@ -223,11 +267,7 @@ async function runDownloadSession(session, onProgress) {
       console.warn("文件下载失败:", name, error);
     } finally {
       finished += 1;
-      onProgress?.(finished, total, {
-        current: name,
-        failed: session.pending.length,
-        unresolved: session.unresolved.length,
-      });
+      emitProgress(finished, { current: name, phase: "download" });
     }
   });
 
@@ -270,27 +310,55 @@ async function runDownloadSession(session, onProgress) {
   };
 }
 
-async function resolvePendingOriginalSources(session, onProgress) {
-  const toResolve = session.pending.filter((name) => !session.originalSources.has(name));
+async function resolvePendingOriginalSources(session, emitProgress) {
+  const toResolve = session.pending.filter((name) => {
+    const existing = session.originalSources.get(name);
+    return !existing?.url;
+  });
+  const total = session.images.length + session.videos.length;
+  let resolved = total - toResolve.length;
+
+  // 预览阶段已确认无 URL 的文件，直接记为失败
+  markMissingOriginalSources(session);
+  emitProgress(resolved, { phase: "resolve" });
+
   if (!toResolve.length) return;
 
-  const originals = await resolveOriginalSources(toResolve, (done, total) => {
-    onProgress?.(session.completed.size + done, session.images.length + session.videos.length + total, {
-      phase: "resolve",
-    });
-  });
+  const BATCH_SIZE = 20;
+  for (let offset = 0; offset < toResolve.length; offset += BATCH_SIZE) {
+    const batch = toResolve.slice(offset, offset + BATCH_SIZE);
+    emitProgress(resolved, { current: batch[0], phase: "resolve" });
 
-  for (const name of toResolve) {
-    const source = originals.get(name);
-    if (source?.url) {
-      session.originalSources.set(name, source);
-      continue;
+    const originals = await resolveOriginalSources(batch);
+
+    for (const name of batch) {
+      const source = originals.get(name);
+      if (source?.url) {
+        session.originalSources.set(name, source);
+        session.failureReasons.delete(name);
+        session.unresolved = session.unresolved.filter((item) => item !== name);
+      } else if (!session.unresolved.includes(name)) {
+        session.unresolved.push(name);
+        session.failureReasons.set(name, "后台 Files 未找到");
+      }
+      resolved += 1;
+      emitProgress(resolved, { current: name, phase: "resolve" });
     }
+  }
 
+  markMissingOriginalSources(session);
+  emitProgress(resolved, { phase: "resolve" });
+}
+
+function markMissingOriginalSources(session) {
+  for (const name of session.pending) {
+    if (session.originalSources.get(name)?.url) continue;
     if (!session.unresolved.includes(name)) {
       session.unresolved.push(name);
     }
-    session.failureReasons.set(name, "后台 Files 未找到");
+    if (!session.failureReasons.has(name)) {
+      session.failureReasons.set(name, "后台 Files 未找到");
+    }
   }
 }
 
@@ -345,7 +413,7 @@ async function saveZip(zip, zipBaseName, zipSuffix = "") {
   saveBlob(content, filename);
 }
 
-async function resolveOriginalSources(filenames, onProgress) {
+async function resolveOriginalSources(filenames) {
   const response = await fetch("/app/original-sources", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -356,8 +424,6 @@ async function resolveOriginalSources(filenames, onProgress) {
   if (!response.ok) {
     throw new Error(payload?.error || `原图解析失败：HTTP ${response.status}`);
   }
-
-  onProgress?.(filenames.length, filenames.length);
 
   return new Map(
     Object.entries(payload.sources || {}).map(([filename, source]) => [
@@ -394,10 +460,11 @@ async function fetchOriginalEntry(name, originalSources) {
 
 async function fetchCdnEntry(name, cdnPrefix) {
   const prefix = normalizeCdn(cdnPrefix);
-  if (!prefix) throw new Error("请先填写 CDN 前缀");
+  if (!prefix) throw new Error("请先填写店铺域名");
 
   const expectedMime = mimeForExt(getExtFromFilename(name));
-  const blob = await fetchBestQualityBlob(prefix, name, expectedMime);
+  const accept = buildAcceptForName(name);
+  const blob = await fetchBestQualityBlob(prefix, name, accept, expectedMime);
 
   return {
     fileName: keepOriginalOrAddExt(name, blob.type),
@@ -444,24 +511,23 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS)
   }
 }
 
-async function fetchBestQualityBlob(cdnPrefix, name, expectedMime) {
+async function fetchBestQualityBlob(cdnPrefix, name, accept, expectedMime) {
   let bestBlob = null;
-  let lastError = null;
+  const responseStatuses = [];
+  let hasNetworkFailure = false;
 
   for (const url of buildDownloadUrlCandidates(cdnPrefix, name)) {
     try {
-      // 不带自定义 Header，避免 CORS 预检；http CDN 常会 301 到 https
-      const response = await fetchWithTimeout(url);
-
-      if (response.status === 404 || response.status === 410) {
-        throw new DownloadError(`HTTP ${response.status}`, {
-          permanent: true,
-          status: response.status,
-        });
-      }
+      // 与 shopify-json-inspector 一致：按扩展名声明 Accept，避免 CDN 内容协商成错误格式
+      const response = await fetchWithTimeout(url, {
+        headers: {
+          Accept: accept,
+          "Cache-Control": "no-transform",
+        },
+      });
 
       if (!response.ok) {
-        lastError = new DownloadError(`HTTP ${response.status}`, { status: response.status });
+        responseStatuses.push(response.status);
         continue;
       }
 
@@ -470,13 +536,22 @@ async function fetchBestQualityBlob(cdnPrefix, name, expectedMime) {
         bestBlob = blob;
       }
       if (expectedMime && blob.type === expectedMime) return blob;
-    } catch (error) {
-      if (isPermanentFailure(error)) throw error;
-      lastError = error;
+    } catch {
+      hasNetworkFailure = true;
     }
   }
 
-  if (!bestBlob) throw lastError || new DownloadError("fetch failed");
+  if (!bestBlob) {
+    const onlyNotFound =
+      responseStatuses.length > 0 &&
+      responseStatuses.every((status) => status === 404 || status === 410) &&
+      !hasNetworkFailure;
+    if (onlyNotFound) {
+      throw new DownloadError("HTTP 404", { permanent: true, status: 404 });
+    }
+    throw new DownloadError("fetch failed");
+  }
+
   return bestBlob;
 }
 
@@ -576,6 +651,12 @@ function mimeForExt(ext) {
     default:
       return "";
   }
+}
+
+function buildAcceptForName(filename) {
+  const mime = mimeForExt(getExtFromFilename(filename));
+  if (mime) return `${mime};q=1.0, image/*;q=0.01`;
+  return "image/*";
 }
 
 function extToFormat(ext) {

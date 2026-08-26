@@ -7,10 +7,6 @@
   padding-inline: 4px 20px;
 }
 
-.inspector-aside {
-  margin-inline-end: 8px;
-}
-
 .inspector-download-actions {
   display: flex;
   flex-wrap: wrap;
@@ -23,6 +19,63 @@
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+}
+
+.inspector-input-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.inspector-input-header s-heading,
+.inspector-input-header h2,
+.inspector-input-header h3 {
+  margin: 0;
+  min-width: 0;
+}
+
+.cdn-domain-history {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cdn-domain-history-label {
+  font-size: 12px;
+  line-height: 1.4;
+  color: #616a75;
+}
+
+.cdn-domain-history-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cdn-domain-chip {
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid #dbe1e8;
+  border-radius: 8px;
+  background: #fff;
+  color: #202223;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.3;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cdn-domain-chip:hover,
+.cdn-domain-chip.is-active {
+  border-color: #008060;
+  color: #008060;
+  background: #f1f8f5;
 }
 
 .stats-panel {
@@ -239,7 +292,6 @@
 }
 
 .progress-wrapper {
-  margin-top: 8px;
   padding: 12px;
   border: 1px solid #e1e5ea;
   border-radius: 10px;
