@@ -7,8 +7,10 @@ import {
 } from "./inspector";
 
 const SHOPIFY_MAX_IMAGE_WIDTH = 5760;
-const FETCH_TIMEOUT_MS = 12000;
-const DOWNLOAD_CONCURRENCY = 4;
+/** 大图 / 视频需要更长超时，避免误判失败后反复重试 */
+const FETCH_TIMEOUT_MS = 30000;
+/** 浏览器对同源约 6 连接；跨 CDN/GCS 可略高，过高易触发限流 */
+const DOWNLOAD_CONCURRENCY = 8;
 
 /** @type {DownloadSession | null} */
 let currentDownloadSession = null;
@@ -219,7 +221,17 @@ function seedOriginalSources(sources) {
 
 async function runDownloadSession(session, onProgress) {
   const total = session.images.length + session.videos.length;
-  const emitProgress = (done, meta = {}) => {
+  let lastProgressAt = 0;
+  let pendingProgress = null;
+  let progressFlushTimer = null;
+
+  const flushProgress = () => {
+    if (!pendingProgress) return;
+    const { done, meta } = pendingProgress;
+    pendingProgress = null;
+    progressFlushTimer = null;
+    lastProgressAt = Date.now();
+
     const failedNames = session.pending.filter(
       (name) => session.failureReasons.has(name) || session.unresolved.includes(name),
     );
@@ -234,42 +246,68 @@ async function runDownloadSession(session, onProgress) {
     });
   };
 
-  if (session.mode === "original") {
-    await resolvePendingOriginalSources(session, emitProgress);
-  } else if (!normalizeCdn(session.cdnPrefix)) {
-    throw new Error("请先填写店铺域名");
-  }
-
-  const retryablePending = session.pending.filter(
-    (name) => !session.unresolved.includes(name),
-  );
-  let finished = total - retryablePending.length;
-
-  emitProgress(finished, { phase: "download" });
-
-  await mapPool(retryablePending, DOWNLOAD_CONCURRENCY, async (name) => {
-    try {
-      const kind = session.kindByName.get(name) || "image";
-      const entry =
-        session.mode === "original" || kind === "video"
-          ? await fetchOriginalEntry(name, session.originalSources)
-          : await fetchCdnEntry(name, session.cdnPrefix);
-
-      session.completed.set(name, entry);
-      session.pending = session.pending.filter((item) => item !== name);
-      session.failureReasons.delete(name);
-    } catch (error) {
-      const reason = formatFailureReason(error);
-      session.failureReasons.set(name, reason);
-      if (isPermanentFailure(error) && !session.unresolved.includes(name)) {
-        session.unresolved.push(name);
+  const emitProgress = (done, meta = {}, { force = false } = {}) => {
+    pendingProgress = { done, meta };
+    const elapsed = Date.now() - lastProgressAt;
+    if (force || elapsed >= 120 || done >= total || done === 0) {
+      if (progressFlushTimer) {
+        clearTimeout(progressFlushTimer);
+        progressFlushTimer = null;
       }
-      console.warn("文件下载失败:", name, error);
-    } finally {
-      finished += 1;
-      emitProgress(finished, { current: name, phase: "download" });
+      flushProgress();
+      return;
     }
-  });
+    if (!progressFlushTimer) {
+      progressFlushTimer = setTimeout(flushProgress, 120 - elapsed);
+    }
+  };
+
+  try {
+    if (session.mode === "original") {
+      await resolvePendingOriginalSources(session, emitProgress);
+    } else if (!normalizeCdn(session.cdnPrefix)) {
+      throw new Error("请先填写店铺域名");
+    }
+
+    const retryablePending = session.pending.filter(
+      (name) => !session.unresolved.includes(name),
+    );
+    let finished = total - retryablePending.length;
+
+    emitProgress(finished, { phase: "download" }, { force: true });
+
+    await mapPool(retryablePending, DOWNLOAD_CONCURRENCY, async (name) => {
+      try {
+        const kind = session.kindByName.get(name) || "image";
+        const entry =
+          session.mode === "original" || kind === "video"
+            ? await fetchOriginalEntry(name, session.originalSources)
+            : await fetchCdnEntry(name, session.cdnPrefix);
+
+        session.completed.set(name, entry);
+        session.pending = session.pending.filter((item) => item !== name);
+        session.failureReasons.delete(name);
+      } catch (error) {
+        const reason = formatFailureReason(error);
+        session.failureReasons.set(name, reason);
+        if (isPermanentFailure(error) && !session.unresolved.includes(name)) {
+          session.unresolved.push(name);
+        }
+        console.warn("文件下载失败:", name, error);
+      } finally {
+        finished += 1;
+        emitProgress(finished, { current: name, phase: "download" });
+      }
+    });
+
+    emitProgress(finished, { phase: "download" }, { force: true });
+  } finally {
+    if (progressFlushTimer) {
+      clearTimeout(progressFlushTimer);
+      progressFlushTimer = null;
+    }
+    flushProgress();
+  }
 
   const success = session.completed.size;
   const failed = session.pending.length;
@@ -367,12 +405,14 @@ function buildZipFromSession(session) {
   const folder = zip.folder(normalizeZipBaseName(session.zipBaseName));
   const usedEntryNames = new Set();
   const orderedNames = [...session.images, ...session.videos];
+  // 图片/视频本身已压缩，STORE 可大幅加快打包且几乎不增大体积
+  const storeOpts = { compression: "STORE" };
 
   for (const name of orderedNames) {
     const entry = session.completed.get(name);
     if (!entry) continue;
     const fileName = flattenZipEntryName(entry.fileName, usedEntryNames);
-    folder.file(fileName, entry.blob);
+    folder.file(fileName, entry.blob, storeOpts);
   }
 
   if (session.pending.length) {
@@ -408,7 +448,13 @@ function buildZipFromSession(session) {
 }
 
 async function saveZip(zip, zipBaseName, zipSuffix = "") {
-  const content = await zip.generateAsync({ type: "blob" });
+  const content = await zip.generateAsync({
+    type: "blob",
+    // 媒体已用 STORE；清单等小文本默认压缩即可
+    compression: "DEFLATE",
+    compressionOptions: { level: 1 },
+    streamFiles: true,
+  });
   const filename = `${normalizeZipBaseName(zipBaseName)}${zipSuffix || ""}.zip`;
   saveBlob(content, filename);
 }
@@ -516,9 +562,10 @@ async function fetchBestQualityBlob(cdnPrefix, name, accept, expectedMime) {
   const responseStatuses = [];
   let hasNetworkFailure = false;
 
+  // 候选按质量优先排序；成功且格式匹配则立即返回，避免把同一张图下多遍
   for (const url of buildDownloadUrlCandidates(cdnPrefix, name)) {
     try {
-      // 与 shopify-json-inspector 一致：按扩展名声明 Accept，避免 CDN 内容协商成错误格式
+      // 按扩展名声明 Accept，避免 CDN 内容协商成错误格式
       const response = await fetchWithTimeout(url, {
         headers: {
           Accept: accept,
@@ -532,10 +579,12 @@ async function fetchBestQualityBlob(cdnPrefix, name, accept, expectedMime) {
       }
 
       const blob = await response.blob();
+      if (!expectedMime || blob.type === expectedMime || !blob.type) {
+        return blob;
+      }
       if (!bestBlob || isBetterBlob(blob, bestBlob, expectedMime)) {
         bestBlob = blob;
       }
-      if (expectedMime && blob.type === expectedMime) return blob;
     } catch {
       hasNetworkFailure = true;
     }
