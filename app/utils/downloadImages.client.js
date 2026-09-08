@@ -7,10 +7,22 @@ import {
 } from "./inspector";
 
 const SHOPIFY_MAX_IMAGE_WIDTH = 5760;
-/** 大图 / 视频需要更长超时，避免误判失败后反复重试 */
-const FETCH_TIMEOUT_MS = 30000;
-/** 浏览器对同源约 6 连接；跨 CDN/GCS 可略高，过高易触发限流 */
-const DOWNLOAD_CONCURRENCY = 8;
+/** 图片请求超时（含响应体） */
+const IMAGE_FETCH_TIMEOUT_MS = 30000;
+/** 视频建连超时；传输出空闲超时；硬上限按体积估算 */
+const VIDEO_CONNECT_TIMEOUT_MS = 45000;
+const VIDEO_IDLE_TIMEOUT_MS = 25000;
+const VIDEO_FETCH_TIMEOUT_MS = 180000;
+const VIDEO_FETCH_TIMEOUT_MAX_MS = 600000;
+/** 视频过大时分片并行拉取（CDN 支持 Range 时可显著提速） */
+const VIDEO_PARALLEL_MIN_BYTES = 6 * 1024 * 1024;
+const VIDEO_PARALLEL_PARTS = 3;
+/** 图片可略高并发；视频 3 路 + 分片，兼顾吞吐与稳定性 */
+const IMAGE_DOWNLOAD_CONCURRENCY = 6;
+const VIDEO_DOWNLOAD_CONCURRENCY = 3;
+const MIXED_DOWNLOAD_CONCURRENCY = 4;
+/** @deprecated 兼容旧调用；等同图片超时 */
+const FETCH_TIMEOUT_MS = IMAGE_FETCH_TIMEOUT_MS;
 
 /** @type {DownloadSession | null} */
 let currentDownloadSession = null;
@@ -269,19 +281,21 @@ async function runDownloadSession(session, onProgress) {
       throw new Error("请先填写店铺域名");
     }
 
-    const retryablePending = session.pending.filter(
-      (name) => !session.unresolved.includes(name),
+    const retryablePending = sortPendingForDownload(
+      session,
+      session.pending.filter((name) => !session.unresolved.includes(name)),
     );
     let finished = total - retryablePending.length;
+    const concurrency = pickDownloadConcurrency(session, retryablePending);
 
     emitProgress(finished, { phase: "download" }, { force: true });
 
-    await mapPool(retryablePending, DOWNLOAD_CONCURRENCY, async (name) => {
+    await mapPool(retryablePending, concurrency, async (name) => {
       try {
         const kind = session.kindByName.get(name) || "image";
         const entry =
           session.mode === "original" || kind === "video"
-            ? await fetchOriginalEntry(name, session.originalSources)
+            ? await fetchOriginalEntry(name, session.originalSources, kind)
             : await fetchCdnEntry(name, session.cdnPrefix);
 
         session.completed.set(name, entry);
@@ -479,29 +493,246 @@ async function resolveOriginalSources(filenames) {
   );
 }
 
-async function fetchOriginalEntry(name, originalSources) {
+async function fetchOriginalEntry(name, originalSources, kind = "image") {
   const source = originalSources.get(name);
   if (!source?.url) {
     throw new DownloadError("后台 Files 未找到", { permanent: true });
   }
 
-  const response = await fetchWithTimeout(source.url);
-  if (response.status === 404 || response.status === 410) {
-    throw new DownloadError(`HTTP ${response.status}`, {
-      permanent: true,
-      status: response.status,
+  try {
+    const blob =
+      kind === "video"
+        ? await fetchVideoBlob(source.url, source.fileSize)
+        : await fetchBlobWithTimeout(source.url, {}, IMAGE_FETCH_TIMEOUT_MS);
+
+    const fileName = keepOriginalOrAddExt(
+      name,
+      source.mimeType || blob.type || "",
+    );
+
+    return { fileName, blob };
+  } catch (error) {
+    if (error instanceof DownloadError) throw error;
+    if (error?.name === "AbortError") {
+      throw new DownloadError(
+        `请求超时（${Math.round(timeoutForEntry(kind, source.fileSize) / 1000)}s）`,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * 视频：大文件优先 Range 分片并行；失败则回退单连接流式下载。
+ * 用「建连超时 + 传输空闲超时」替代整段绝对超时，避免误杀慢但在传的大文件。
+ */
+async function fetchVideoBlob(url, knownSize) {
+  const size = Number(knownSize) || 0;
+
+  if (size >= VIDEO_PARALLEL_MIN_BYTES) {
+    try {
+      return await fetchBlobInParallelRanges(url, size);
+    } catch (error) {
+      console.warn("视频分片并行下载失败，回退单连接:", error);
+    }
+  }
+
+  return fetchBlobWithIdleTimeout(url, {
+    connectTimeoutMs: VIDEO_CONNECT_TIMEOUT_MS,
+    idleTimeoutMs: VIDEO_IDLE_TIMEOUT_MS,
+    hardTimeoutMs: timeoutForEntry("video", size),
+  });
+}
+
+async function fetchBlobInParallelRanges(url, fileSize) {
+  const parts = VIDEO_PARALLEL_PARTS;
+  const chunkSize = Math.ceil(fileSize / parts);
+  const hardTimeoutMs = timeoutForEntry("video", fileSize);
+  const controller = new AbortController();
+  const hardTimer = setTimeout(() => controller.abort(), hardTimeoutMs);
+
+  try {
+    const chunks = await Promise.all(
+      Array.from({ length: parts }, async (_, index) => {
+        const start = index * chunkSize;
+        const end = Math.min(fileSize - 1, (index + 1) * chunkSize - 1);
+        const response = await fetch(url, {
+          headers: { Range: `bytes=${start}-${end}` },
+          signal: controller.signal,
+        });
+
+        // 必须是 206；若 CDN 忽略 Range 回 200，整文件会下多次，直接失败回退
+        if (response.status !== 206) {
+          throw new DownloadError(`Range 不受支持（HTTP ${response.status}）`);
+        }
+
+        const blob = await readResponseBlobWithIdle(
+          response,
+          VIDEO_IDLE_TIMEOUT_MS,
+          controller,
+        );
+        return { index, blob };
+      }),
+    );
+
+    chunks.sort((a, b) => a.index - b.index);
+    const blob = new Blob(
+      chunks.map((chunk) => chunk.blob),
+      { type: chunks[0]?.blob?.type || "" },
+    );
+    // fileSize 偶发不准；明显偏小则回退整文件下载
+    if (blob.size + 1024 < fileSize * 0.95) {
+      throw new DownloadError(`分片不完整（${blob.size}/${fileSize}）`);
+    }
+    return blob;
+  } finally {
+    clearTimeout(hardTimer);
+  }
+}
+
+async function fetchBlobWithTimeout(url, options = {}, timeoutMs = IMAGE_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
     });
+    if (response.status === 404 || response.status === 410) {
+      throw new DownloadError(`HTTP ${response.status}`, {
+        permanent: true,
+        status: response.status,
+      });
+    }
+    if (!response.ok) {
+      throw new DownloadError(`HTTP ${response.status}`, { status: response.status });
+    }
+    return await response.blob();
+  } catch (error) {
+    if (error instanceof DownloadError) throw error;
+    if (error?.name === "AbortError") {
+      throw new DownloadError(`请求超时（${Math.round(timeoutMs / 1000)}s）`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!response.ok) {
-    throw new DownloadError(`HTTP ${response.status}`, { status: response.status });
+}
+
+async function fetchBlobWithIdleTimeout(
+  url,
+  {
+    connectTimeoutMs = VIDEO_CONNECT_TIMEOUT_MS,
+    idleTimeoutMs = VIDEO_IDLE_TIMEOUT_MS,
+    hardTimeoutMs = VIDEO_FETCH_TIMEOUT_MAX_MS,
+    headers,
+  } = {},
+) {
+  const controller = new AbortController();
+  const hardTimer = setTimeout(() => controller.abort(), hardTimeoutMs);
+  const connectTimer = setTimeout(() => controller.abort(), connectTimeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      headers,
+      signal: controller.signal,
+    });
+    clearTimeout(connectTimer);
+
+    if (response.status === 404 || response.status === 410) {
+      throw new DownloadError(`HTTP ${response.status}`, {
+        permanent: true,
+        status: response.status,
+      });
+    }
+    if (!response.ok) {
+      throw new DownloadError(`HTTP ${response.status}`, { status: response.status });
+    }
+
+    return await readResponseBlobWithIdle(response, idleTimeoutMs, controller);
+  } catch (error) {
+    if (error instanceof DownloadError) throw error;
+    if (error?.name === "AbortError") {
+      throw new DownloadError(
+        `请求超时（空闲 ${Math.round(idleTimeoutMs / 1000)}s / 上限 ${Math.round(hardTimeoutMs / 1000)}s）`,
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(hardTimer);
+    clearTimeout(connectTimer);
+  }
+}
+
+async function readResponseBlobWithIdle(response, idleTimeoutMs, controller) {
+  if (!response.body?.getReader) {
+    return response.blob();
   }
 
-  const fileName = keepOriginalOrAddExt(
-    name,
-    source.mimeType || response.headers.get("content-type") || "",
-  );
+  let idleTimer = setTimeout(() => controller.abort(), idleTimeoutMs);
+  const bumpIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => controller.abort(), idleTimeoutMs);
+  };
 
-  return { fileName, blob: await response.blob() };
+  try {
+    const reader = response.body.getReader();
+    const chunks = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bumpIdle();
+      chunks.push(value);
+    }
+    return new Blob(chunks, {
+      type: response.headers.get("content-type") || "",
+    });
+  } finally {
+    clearTimeout(idleTimer);
+  }
+}
+
+/**
+ * 视频并发过高时，排队中的 fetch 会先烧完 AbortController 再真正发出请求。
+ * 3 路文件并发 + 大文件分片，在吞吐和稳定性之间折中。
+ */
+function pickDownloadConcurrency(session, pending) {
+  if (!pending.length) return IMAGE_DOWNLOAD_CONCURRENCY;
+
+  let videoCount = 0;
+  for (const name of pending) {
+    if (session.kindByName.get(name) === "video") videoCount += 1;
+  }
+
+  if (videoCount === 0) return IMAGE_DOWNLOAD_CONCURRENCY;
+  if (videoCount === pending.length) return VIDEO_DOWNLOAD_CONCURRENCY;
+  return MIXED_DOWNLOAD_CONCURRENCY;
+}
+
+/** 小文件优先，尽快腾出连接并改善进度反馈 */
+function sortPendingForDownload(session, pending) {
+  return [...pending].sort((a, b) => {
+    const sizeA = Number(session.originalSources.get(a)?.fileSize) || 0;
+    const sizeB = Number(session.originalSources.get(b)?.fileSize) || 0;
+    if (sizeA !== sizeB) return sizeA - sizeB;
+
+    const kindA = session.kindByName.get(a) === "video" ? 1 : 0;
+    const kindB = session.kindByName.get(b) === "video" ? 1 : 0;
+    return kindA - kindB;
+  });
+}
+
+/** 按体积估算硬超时上限：约 1.5s/MB，视频下限 180s、上限 10min */
+function timeoutForEntry(kind, fileSize) {
+  if (kind !== "video") return IMAGE_FETCH_TIMEOUT_MS;
+
+  const bytes = Number(fileSize) || 0;
+  if (!bytes) return VIDEO_FETCH_TIMEOUT_MS;
+
+  const mb = bytes / (1024 * 1024);
+  const estimated = Math.ceil(VIDEO_FETCH_TIMEOUT_MS + mb * 1500);
+  return Math.min(VIDEO_FETCH_TIMEOUT_MAX_MS, Math.max(VIDEO_FETCH_TIMEOUT_MS, estimated));
 }
 
 async function fetchCdnEntry(name, cdnPrefix) {

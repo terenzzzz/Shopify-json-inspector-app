@@ -45,6 +45,38 @@ export default function Index() {
   const [themeTemplatesError, setThemeTemplatesError] = useState("");
   const [selectedThemeTemplate, setSelectedThemeTemplate] = useState("");
   const [themeTemplateLoading, setThemeTemplateLoading] = useState(false);
+  const [themeQuery, setThemeQuery] = useState("");
+  const [themeMenuOpen, setThemeMenuOpen] = useState(false);
+  const [themeHighlightIndex, setThemeHighlightIndex] = useState(0);
+  const [templateQuery, setTemplateQuery] = useState("");
+  const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
+  const [templateHighlightIndex, setTemplateHighlightIndex] = useState(0);
+  const themeComboboxRef = useRef(null);
+  const selectThemeRef = useRef(null);
+  const suppressThemeQuerySyncRef = useRef(false);
+  const templateComboboxRef = useRef(null);
+  const selectThemeTemplateRef = useRef(null);
+  const suppressTemplateQuerySyncRef = useRef(false);
+
+  const matchedThemes = useMemo(
+    () =>
+      filterByQuery(shopThemes, themeQuery, (theme) => [
+        theme.name,
+        formatThemeOptionLabel(theme),
+        theme.role,
+        translateThemeRole(theme.role),
+      ]),
+    [shopThemes, themeQuery],
+  );
+
+  const matchedThemeTemplates = useMemo(
+    () =>
+      filterByQuery(themeTemplates, templateQuery, (filename) => [
+        filename,
+        formatThemeTemplateLabel(filename),
+      ]),
+    [themeTemplates, templateQuery],
+  );
 
   const inspection = useMemo(() => {
     if (!rawJson.trim()) return null;
@@ -93,9 +125,14 @@ export default function Index() {
       if (signal?.aborted) return;
 
       setShopThemes(Array.isArray(payload.themes) ? payload.themes : []);
-      setSelectedThemeId(payload.theme?.id || "");
+      const nextTheme = payload.theme || null;
+      setSelectedThemeId(nextTheme?.id || "");
+      setThemeQuery(nextTheme ? formatThemeOptionLabel(nextTheme) : "");
+      setThemeMenuOpen(false);
       setThemeTemplates(Array.isArray(payload.templates) ? payload.templates : []);
       setSelectedThemeTemplate("");
+      setTemplateQuery("");
+      setTemplateMenuOpen(false);
       if (payload.error) {
         setThemeTemplatesError(payload.error);
       }
@@ -104,8 +141,12 @@ export default function Index() {
       console.warn("主题模板列表加载失败:", error);
       setShopThemes([]);
       setSelectedThemeId("");
+      setThemeQuery("");
+      setThemeMenuOpen(false);
       setThemeTemplates([]);
       setSelectedThemeTemplate("");
+      setTemplateQuery("");
+      setTemplateMenuOpen(false);
       setThemeTemplatesError(error.message || "主题模板列表加载失败");
     } finally {
       if (!signal?.aborted) {
@@ -177,6 +218,172 @@ export default function Index() {
     setPermanentFailedImages(new Set());
   }, [downloadMode, normalizedCdn]);
 
+  useEffect(() => {
+    setThemeHighlightIndex(0);
+  }, [themeQuery, shopThemes]);
+
+  useEffect(() => {
+    setTemplateHighlightIndex(0);
+  }, [templateQuery, themeTemplates]);
+
+  useEffect(() => {
+    if (!themeMenuOpen) return undefined;
+
+    const onPointerDown = (event) => {
+      if (!themeComboboxRef.current?.contains(event.target)) {
+        setThemeMenuOpen(false);
+        const selected = shopThemes.find((theme) => theme.id === selectedThemeId);
+        setThemeQuery(selected ? formatThemeOptionLabel(selected) : "");
+      }
+    };
+
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [themeMenuOpen, selectedThemeId, shopThemes]);
+
+  useEffect(() => {
+    const root = themeComboboxRef.current;
+    if (!root) return undefined;
+
+    const onKeyDown = (event) => {
+      if (themeTemplatesLoading || themeTemplateLoading || shopThemes.length === 0) {
+        return;
+      }
+
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setThemeMenuOpen(true);
+        setThemeHighlightIndex((index) =>
+          matchedThemes.length ? (index + 1) % matchedThemes.length : 0,
+        );
+        return;
+      }
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setThemeMenuOpen(true);
+        setThemeHighlightIndex((index) =>
+          matchedThemes.length
+            ? (index - 1 + matchedThemes.length) % matchedThemes.length
+            : 0,
+        );
+        return;
+      }
+
+      if (event.key === "Enter" && themeMenuOpen) {
+        const theme = matchedThemes[themeHighlightIndex];
+        if (!theme) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        selectThemeRef.current?.(theme.id);
+        return;
+      }
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setThemeMenuOpen(false);
+        const selected = shopThemes.find((item) => item.id === selectedThemeId);
+        setThemeQuery(selected ? formatThemeOptionLabel(selected) : "");
+      }
+    };
+
+    root.addEventListener("keydown", onKeyDown, true);
+    return () => root.removeEventListener("keydown", onKeyDown, true);
+  }, [
+    matchedThemes,
+    selectedThemeId,
+    shopThemes,
+    themeHighlightIndex,
+    themeMenuOpen,
+    themeTemplateLoading,
+    themeTemplatesLoading,
+  ]);
+
+  useEffect(() => {
+    if (!templateMenuOpen) return undefined;
+
+    const onPointerDown = (event) => {
+      if (!templateComboboxRef.current?.contains(event.target)) {
+        setTemplateMenuOpen(false);
+        setTemplateQuery(
+          selectedThemeTemplate ? formatThemeTemplateLabel(selectedThemeTemplate) : "",
+        );
+      }
+    };
+
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [templateMenuOpen, selectedThemeTemplate]);
+
+  useEffect(() => {
+    const root = templateComboboxRef.current;
+    if (!root) return undefined;
+
+    const onKeyDown = (event) => {
+      if (
+        themeTemplatesLoading ||
+        themeTemplateLoading ||
+        !selectedThemeId ||
+        themeTemplates.length === 0
+      ) {
+        return;
+      }
+
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setTemplateMenuOpen(true);
+        setTemplateHighlightIndex((index) =>
+          matchedThemeTemplates.length
+            ? (index + 1) % matchedThemeTemplates.length
+            : 0,
+        );
+        return;
+      }
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setTemplateMenuOpen(true);
+        setTemplateHighlightIndex((index) =>
+          matchedThemeTemplates.length
+            ? (index - 1 + matchedThemeTemplates.length) % matchedThemeTemplates.length
+            : 0,
+        );
+        return;
+      }
+
+      if (event.key === "Enter" && templateMenuOpen) {
+        const filename = matchedThemeTemplates[templateHighlightIndex];
+        if (!filename) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        selectThemeTemplateRef.current?.(filename);
+        return;
+      }
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setTemplateMenuOpen(false);
+        setTemplateQuery(
+          selectedThemeTemplate ? formatThemeTemplateLabel(selectedThemeTemplate) : "",
+        );
+      }
+    };
+
+    root.addEventListener("keydown", onKeyDown, true);
+    return () => root.removeEventListener("keydown", onKeyDown, true);
+  }, [
+    matchedThemeTemplates,
+    selectedThemeId,
+    selectedThemeTemplate,
+    templateHighlightIndex,
+    templateMenuOpen,
+    themeTemplateLoading,
+    themeTemplates.length,
+    themeTemplatesLoading,
+  ]);
+
   const loadRawJson = (raw, filename) => {
     setRawJson(raw);
     setSourceName(filename);
@@ -189,22 +396,61 @@ export default function Index() {
     setDownloadState(createEmptyDownloadState());
   };
 
-  const onThemeChange = async (event) => {
-    const themeId = event.currentTarget.value;
-    if (!themeId || themeId === selectedThemeId) return;
+  const syncComboboxFieldValue = (root, label, suppressRef) => {
+    requestAnimationFrame(() => {
+      const field = root?.querySelector("s-search-field");
+      if (field) {
+        field.value = label;
+        if (typeof field.blur === "function") field.blur();
+      }
+      requestAnimationFrame(() => {
+        suppressRef.current = false;
+      });
+    });
+  };
+
+  const selectTheme = async (themeId) => {
+    if (!themeId) return;
+
+    const theme = shopThemes.find((item) => item.id === themeId);
+    const label = theme ? formatThemeOptionLabel(theme) : "";
+    suppressThemeQuerySyncRef.current = true;
+    setThemeQuery(label);
+    setThemeMenuOpen(false);
+    syncComboboxFieldValue(themeComboboxRef.current, label, suppressThemeQuerySyncRef);
+
+    if (themeId === selectedThemeId) return;
 
     setSelectedThemeId(themeId);
     setSelectedThemeTemplate("");
+    setTemplateQuery("");
+    setTemplateMenuOpen(false);
 
     const controller = new AbortController();
     await loadThemeData(themeId, controller.signal);
   };
+  selectThemeRef.current = selectTheme;
 
-  const onThemeTemplateChange = async (event) => {
-    const filename = event.currentTarget.value;
-    setSelectedThemeTemplate(filename);
+  const onThemeQueryInput = (value) => {
+    if (suppressThemeQuerySyncRef.current) return;
+    setThemeQuery(value);
+    setThemeMenuOpen(true);
+  };
 
+  const selectThemeTemplate = async (filename) => {
     if (!filename) return;
+
+    const label = formatThemeTemplateLabel(filename);
+    suppressTemplateQuerySyncRef.current = true;
+    setSelectedThemeTemplate(filename);
+    setTemplateQuery(label);
+    setTemplateMenuOpen(false);
+    syncComboboxFieldValue(
+      templateComboboxRef.current,
+      label,
+      suppressTemplateQuerySyncRef,
+    );
+
     if (!selectedThemeId) {
       shopify.toast.show("请先选择主题", { isError: true });
       return;
@@ -225,6 +471,7 @@ export default function Index() {
       }
 
       loadRawJson(payload.content || "", payload.filename || filename);
+      setTemplateQuery(formatThemeTemplateLabel(payload.filename || filename));
       shopify.toast.show(`已加载 ${payload.filename || filename}`);
     } catch (error) {
       console.warn("主题模板读取失败:", error);
@@ -232,6 +479,13 @@ export default function Index() {
     } finally {
       setThemeTemplateLoading(false);
     }
+  };
+  selectThemeTemplateRef.current = selectThemeTemplate;
+
+  const onTemplateQueryInput = (value) => {
+    if (suppressTemplateQuerySyncRef.current) return;
+    setTemplateQuery(value);
+    setTemplateMenuOpen(true);
   };
 
   const onFileChange = async (event) => {
@@ -245,6 +499,8 @@ export default function Index() {
 
     loadRawJson(await file.text(), file.name);
     setSelectedThemeTemplate("");
+    setTemplateQuery("");
+    setTemplateMenuOpen(false);
   };
 
   const rememberCdnDomain = (value = cdnDomain) => {
@@ -259,6 +515,10 @@ export default function Index() {
     setRawJson("");
     setSourceName("");
     setSelectedThemeTemplate("");
+    setThemeQuery("");
+    setThemeMenuOpen(false);
+    setTemplateQuery("");
+    setTemplateMenuOpen(false);
     setCdnDomain("");
     setZipName("");
     setDownloadMode("original");
@@ -514,51 +774,127 @@ export default function Index() {
                   重置
                 </s-button>
               </div>
-              <s-select
-                label="选择主题"
-                value={selectedThemeId}
-                disabled={themeTemplatesLoading || themeTemplateLoading || shopThemes.length === 0}
-                onChange={onThemeChange}
-                onInput={onThemeChange}
+              <div
+                className={`inspector-combobox ${themeMenuOpen ? "is-open" : ""}`}
+                ref={themeComboboxRef}
               >
-                <s-option value="">
-                  {themeTemplatesLoading
-                    ? "正在加载主题..."
-                    : shopThemes.length > 0
-                      ? "选择主题"
-                      : "未找到可用主题"}
-                </s-option>
-                {shopThemes.map((theme) => (
-                  <s-option key={theme.id} value={theme.id}>
-                    {formatThemeOptionLabel(theme)}
-                  </s-option>
-                ))}
-              </s-select>
-              <s-select
-                label="选择模板 JSON"
-                value={selectedThemeTemplate}
-                disabled={
-                  themeTemplatesLoading ||
-                  themeTemplateLoading ||
-                  !selectedThemeId ||
-                  themeTemplates.length === 0
-                }
-                onChange={onThemeTemplateChange}
-                onInput={onThemeTemplateChange}
+                <s-search-field
+                  label="选择主题"
+                  placeholder={
+                    themeTemplatesLoading
+                      ? "正在加载主题..."
+                      : shopThemes.length === 0
+                        ? "未找到可用主题"
+                        : "输入关键字搜索主题…"
+                  }
+                  value={themeQuery}
+                  autocomplete="off"
+                  disabled={
+                    themeTemplatesLoading ||
+                    themeTemplateLoading ||
+                    shopThemes.length === 0
+                  }
+                  details={
+                    themeQuery.trim()
+                      ? `匹配 ${matchedThemes.length}/${shopThemes.length} 个主题`
+                      : shopThemes.length > 0
+                        ? `共 ${shopThemes.length} 个主题`
+                        : undefined
+                  }
+                  onFocus={() => {
+                    if (shopThemes.length > 0) setThemeMenuOpen(true);
+                  }}
+                  onInput={(event) => onThemeQueryInput(event.currentTarget.value)}
+                  onChange={(event) => onThemeQueryInput(event.currentTarget.value)}
+                ></s-search-field>
+                {themeMenuOpen && shopThemes.length > 0 && (
+                  <div className="inspector-combobox-menu" role="listbox">
+                    {matchedThemes.length === 0 ? (
+                      <div className="inspector-combobox-empty">无匹配主题</div>
+                    ) : (
+                      matchedThemes.map((theme, index) => {
+                        const selected = theme.id === selectedThemeId;
+                        const active = index === themeHighlightIndex;
+                        return (
+                          <button
+                            key={theme.id}
+                            type="button"
+                            role="option"
+                            aria-selected={selected}
+                            className={`inspector-combobox-option ${selected ? "is-selected" : ""} ${active ? "is-active" : ""}`}
+                            onMouseEnter={() => setThemeHighlightIndex(index)}
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => selectTheme(theme.id)}
+                          >
+                            {formatThemeOptionLabel(theme)}
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                )}
+              </div>
+              <div
+                className={`inspector-combobox ${templateMenuOpen ? "is-open" : ""}`}
+                ref={templateComboboxRef}
               >
-                <s-option value="">
-                  {themeTemplatesLoading
-                    ? "正在加载主题模板..."
-                    : themeTemplates.length > 0
-                      ? "选择 templates/*.json"
-                      : "当前主题未找到模板 JSON"}
-                </s-option>
-                {themeTemplates.map((filename) => (
-                  <s-option key={filename} value={filename}>
-                    {formatThemeTemplateLabel(filename)}
-                  </s-option>
-                ))}
-              </s-select>
+                <s-search-field
+                  label="选择模板 JSON"
+                  placeholder={
+                    themeTemplatesLoading
+                      ? "正在加载主题模板..."
+                      : themeTemplates.length === 0
+                        ? "当前主题未找到模板 JSON"
+                        : "输入关键字搜索，如 product、index…"
+                  }
+                  value={templateQuery}
+                  autocomplete="off"
+                  disabled={
+                    themeTemplatesLoading ||
+                    themeTemplateLoading ||
+                    !selectedThemeId ||
+                    themeTemplates.length === 0
+                  }
+                  details={
+                    templateQuery.trim()
+                      ? `匹配 ${matchedThemeTemplates.length}/${themeTemplates.length} 个模板`
+                      : themeTemplates.length > 0
+                        ? `共 ${themeTemplates.length} 个 templates/*.json`
+                        : undefined
+                  }
+                  onFocus={() => {
+                    if (themeTemplates.length > 0) setTemplateMenuOpen(true);
+                  }}
+                  onInput={(event) => onTemplateQueryInput(event.currentTarget.value)}
+                  onChange={(event) => onTemplateQueryInput(event.currentTarget.value)}
+                ></s-search-field>
+                {templateMenuOpen && themeTemplates.length > 0 && (
+                  <div className="inspector-combobox-menu" role="listbox">
+                    {matchedThemeTemplates.length === 0 ? (
+                      <div className="inspector-combobox-empty">无匹配模板</div>
+                    ) : (
+                      matchedThemeTemplates.map((filename, index) => {
+                        const selected = filename === selectedThemeTemplate;
+                        const active = index === templateHighlightIndex;
+                        return (
+                          <button
+                            key={filename}
+                            type="button"
+                            role="option"
+                            aria-selected={selected}
+                            className={`inspector-combobox-option ${selected ? "is-selected" : ""} ${active ? "is-active" : ""}`}
+                            onMouseEnter={() => setTemplateHighlightIndex(index)}
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => selectThemeTemplate(filename)}
+                          >
+                            {formatThemeTemplateLabel(filename)}
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                )}
+              </div>
               {themeTemplatesError && (
                 <s-banner tone="warning">{themeTemplatesError}</s-banner>
               )}
@@ -583,6 +919,8 @@ export default function Index() {
                 value={rawJson}
                 onInput={(event) => {
                   setSelectedThemeTemplate("");
+                  setTemplateQuery("");
+                  setTemplateMenuOpen(false);
                   loadRawJson(event.currentTarget.value, "粘贴.json");
                 }}
               ></s-text-area>
@@ -1326,6 +1664,19 @@ function buildDownloadResultMessage(result, options = {}) {
   }
 
   return parts.join(" ");
+}
+
+function filterByQuery(items, query, getSearchText) {
+  const normalized = String(query || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return items;
+
+  return items.filter((item) =>
+    getSearchText(item)
+      .filter(Boolean)
+      .some((text) => String(text).toLowerCase().includes(normalized)),
+  );
 }
 
 function formatThemeOptionLabel(theme) {
