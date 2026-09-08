@@ -556,7 +556,7 @@ export default function Index() {
       });
     }
 
-    setDownloadState({
+    setDownloadState((state) => ({
       loading: false,
       progress: {
         done: total,
@@ -569,7 +569,8 @@ export default function Index() {
       unresolved: result.unresolved || [],
       failureReasons: result.failureReasons || {},
       partial: Boolean(result.partial),
-    });
+      scope: state.scope,
+    }));
     shopify.toast.show(message, { isError: failedCount > 0 });
   };
 
@@ -649,6 +650,7 @@ export default function Index() {
     setDownloadState({
       ...createEmptyDownloadState(),
       loading: true,
+      scope: "images",
       progress: { done: 0, total: targetImages.length, phase: downloadMode === "original" ? "resolve" : "download" },
     });
 
@@ -667,6 +669,7 @@ export default function Index() {
     } catch (error) {
       setDownloadState({
         ...createEmptyDownloadState(),
+        scope: "images",
         result: error.message,
       });
       shopify.toast.show(error.message, { isError: true });
@@ -696,6 +699,7 @@ export default function Index() {
     setDownloadState({
       ...createEmptyDownloadState(),
       loading: true,
+      scope: "videos",
       progress: { done: 0, total: targetVideos.length, phase: "resolve" },
     });
 
@@ -713,6 +717,7 @@ export default function Index() {
     } catch (error) {
       setDownloadState({
         ...createEmptyDownloadState(),
+        scope: "videos",
         result: error.message,
       });
       shopify.toast.show(error.message, { isError: true });
@@ -998,50 +1003,55 @@ export default function Index() {
           )}
           {stats && <StatsCard stats={stats} />}
           {images && (
-            <ImagesCard
-              images={visibleImages}
-              cdnPrefix={normalizedCdn}
-              downloadMode={downloadMode}
-              originalPreviewSources={originalPreviewSources}
-              originalPreviewLoading={originalPreviewLoading}
-              selectedImages={selectedImages}
-              selectedCount={selectedCount}
-              permanentFailedImages={permanentFailedImages}
-              permanentFailedCount={permanentFailedCount}
-              downloading={downloadState.loading}
-              downloadState={downloadState}
-              onToggle={toggleImage}
-              onSelectAll={() => setSelectedImages(new Set(visibleImages))}
-              onClearSelection={() => setSelectedImages(new Set())}
-              onMarkFailed={markPermanentFailedImage}
-              onPurgeFailed={purgePermanentFailedImages}
-              onDownloadAll={() => downloadImages(visibleImages)}
-              onDownloadSelected={() =>
-                downloadImages(visibleImages.filter((name) => selectedImages.has(name)))
-              }
-              onResume={resumeFailedDownload}
-            />
+            <>
+              <ImagesCard
+                images={visibleImages}
+                cdnPrefix={normalizedCdn}
+                downloadMode={downloadMode}
+                originalPreviewSources={originalPreviewSources}
+                originalPreviewLoading={originalPreviewLoading}
+                selectedImages={selectedImages}
+                selectedCount={selectedCount}
+                permanentFailedImages={permanentFailedImages}
+                permanentFailedCount={permanentFailedCount}
+                downloading={downloadState.loading}
+                downloadState={downloadState}
+                onToggle={toggleImage}
+                onSelectAll={() => setSelectedImages(new Set(visibleImages))}
+                onClearSelection={() => setSelectedImages(new Set())}
+                onMarkFailed={markPermanentFailedImage}
+                onPurgeFailed={purgePermanentFailedImages}
+                onDownloadAll={() => downloadImages(visibleImages)}
+                onDownloadSelected={() =>
+                  downloadImages(visibleImages.filter((name) => selectedImages.has(name)))
+                }
+                onResume={resumeFailedDownload}
+              />
+              <DownloadProgressPanel downloadState={downloadState} scope="images" />
+            </>
           )}
           {videos && (
-            <VideosCard
-              videos={videos}
-              downloadMode={downloadMode}
-              originalPreviewSources={originalPreviewSources}
-              originalPreviewLoading={originalPreviewLoading}
-              selectedVideos={selectedVideos}
-              selectedCount={selectedVideoCount}
-              downloading={downloadState.loading}
-              downloadState={downloadState}
-              shopify={shopify}
-              onToggle={toggleVideo}
-              onSelectAll={() => setSelectedVideos(new Set(videos))}
-              onClearSelection={() => setSelectedVideos(new Set())}
-              onDownloadAll={() => downloadVideos(videos)}
-              onDownloadSelected={() => downloadVideos(selectedVideoList)}
-              onResume={resumeFailedDownload}
-            />
+            <>
+              <VideosCard
+                videos={videos}
+                downloadMode={downloadMode}
+                originalPreviewSources={originalPreviewSources}
+                originalPreviewLoading={originalPreviewLoading}
+                selectedVideos={selectedVideos}
+                selectedCount={selectedVideoCount}
+                downloading={downloadState.loading}
+                downloadState={downloadState}
+                shopify={shopify}
+                onToggle={toggleVideo}
+                onSelectAll={() => setSelectedVideos(new Set(videos))}
+                onClearSelection={() => setSelectedVideos(new Set())}
+                onDownloadAll={() => downloadVideos(videos)}
+                onDownloadSelected={() => downloadVideos(selectedVideoList)}
+                onResume={resumeFailedDownload}
+              />
+              <DownloadProgressPanel downloadState={downloadState} scope="videos" />
+            </>
           )}
-          <DownloadProgressPanel downloadState={downloadState} />
           {inspection?.tree && (
             <StructureCard
               tree={inspection.tree}
@@ -1298,7 +1308,7 @@ function ImagesCard({
             <s-button variant="secondary" onClick={onDownloadAll} disabled={downloading}>
               下载全部 ZIP
             </s-button>
-            {downloadState?.canResume && (
+            {downloadState?.canResume && downloadState?.scope === "images" && (
               <s-button variant="secondary" onClick={onResume} disabled={downloading}>
                 恢复下载
               </s-button>
@@ -1415,7 +1425,7 @@ function VideosCard({
               <s-button variant="secondary" onClick={onDownloadAll} disabled={downloading}>
                 下载全部 ZIP ({videos.length})
               </s-button>
-              {downloadState?.canResume && (
+              {downloadState?.canResume && downloadState?.scope === "videos" && (
                 <s-button variant="secondary" onClick={onResume} disabled={downloading}>
                   恢复下载
                 </s-button>
@@ -1428,8 +1438,9 @@ function VideosCard({
   );
 }
 
-function DownloadProgressPanel({ downloadState }) {
+function DownloadProgressPanel({ downloadState, scope }) {
   if (!downloadState) return null;
+  if (scope && downloadState.scope && downloadState.scope !== scope) return null;
 
   const visible =
     downloadState.loading ||
@@ -1437,6 +1448,8 @@ function DownloadProgressPanel({ downloadState }) {
     (downloadState.failedNames?.length || 0) > 0;
 
   if (!visible) return null;
+  // 无 scope 的历史状态不展示，避免图片/视频下重复出现
+  if (scope && !downloadState.scope) return null;
 
   const progress = downloadState.progress;
   const percent =
@@ -1593,6 +1606,7 @@ function createEmptyDownloadState() {
     unresolved: [],
     failureReasons: {},
     partial: false,
+    scope: null,
   };
 }
 
