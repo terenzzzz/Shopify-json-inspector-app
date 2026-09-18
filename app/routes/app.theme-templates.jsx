@@ -2,7 +2,7 @@ import { authenticate } from "../shopify.server";
 
 const SHOP_THEMES_QUERY = `#graphql
   query ShopThemes {
-    themes(first: 50) {
+    themes(first: 100) {
       nodes {
         id
         name
