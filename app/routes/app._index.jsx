@@ -58,24 +58,52 @@ export default function Index() {
   const selectThemeTemplateRef = useRef(null);
   const suppressTemplateQuerySyncRef = useRef(false);
 
+  const selectedThemeLabel = useMemo(() => {
+    const selected = shopThemes.find((theme) => theme.id === selectedThemeId);
+    return selected ? formatThemeOptionLabel(selected) : "";
+  }, [shopThemes, selectedThemeId]);
+
+  // 已选主题回填到输入框时不当作搜索词；只有用户真正输入时才过滤
+  const themeSearchQuery = useMemo(() => {
+    const trimmed = themeQuery.trim();
+    if (!trimmed) return "";
+    if (selectedThemeLabel && trimmed === selectedThemeLabel) return "";
+    return themeQuery;
+  }, [themeQuery, selectedThemeLabel]);
+
   const matchedThemes = useMemo(
     () =>
-      filterByQuery(shopThemes, themeQuery, (theme) => [
+      filterByQuery(shopThemes, themeSearchQuery, (theme) => [
         theme.name,
         formatThemeOptionLabel(theme),
         theme.role,
         translateThemeRole(theme.role),
       ]),
-    [shopThemes, themeQuery],
+    [shopThemes, themeSearchQuery],
   );
+
+  const selectedTemplateLabel = useMemo(
+    () =>
+      selectedThemeTemplate
+        ? formatThemeTemplateLabel(selectedThemeTemplate)
+        : "",
+    [selectedThemeTemplate],
+  );
+
+  const templateSearchQuery = useMemo(() => {
+    const trimmed = templateQuery.trim();
+    if (!trimmed) return "";
+    if (selectedTemplateLabel && trimmed === selectedTemplateLabel) return "";
+    return templateQuery;
+  }, [templateQuery, selectedTemplateLabel]);
 
   const matchedThemeTemplates = useMemo(
     () =>
-      filterByQuery(themeTemplates, templateQuery, (filename) => [
+      filterByQuery(themeTemplates, templateSearchQuery, (filename) => [
         filename,
         formatThemeTemplateLabel(filename),
       ]),
-    [themeTemplates, templateQuery],
+    [themeTemplates, templateSearchQuery],
   );
 
   const inspection = useMemo(() => {
@@ -220,11 +248,11 @@ export default function Index() {
 
   useEffect(() => {
     setThemeHighlightIndex(0);
-  }, [themeQuery, shopThemes]);
+  }, [themeSearchQuery, shopThemes]);
 
   useEffect(() => {
     setTemplateHighlightIndex(0);
-  }, [templateQuery, themeTemplates]);
+  }, [templateSearchQuery, themeTemplates]);
 
   useEffect(() => {
     if (!themeMenuOpen) return undefined;
@@ -800,14 +828,16 @@ export default function Index() {
                     shopThemes.length === 0
                   }
                   details={
-                    themeQuery.trim()
+                    themeSearchQuery.trim()
                       ? `匹配 ${matchedThemes.length}/${shopThemes.length} 个主题`
                       : shopThemes.length > 0
                         ? `共 ${shopThemes.length} 个主题`
                         : undefined
                   }
                   onFocus={() => {
-                    if (shopThemes.length > 0) setThemeMenuOpen(true);
+                    if (shopThemes.length === 0) return;
+                    setThemeQuery("");
+                    setThemeMenuOpen(true);
                   }}
                   onInput={(event) => onThemeQueryInput(event.currentTarget.value)}
                   onChange={(event) => onThemeQueryInput(event.currentTarget.value)}
@@ -861,14 +891,16 @@ export default function Index() {
                     themeTemplates.length === 0
                   }
                   details={
-                    templateQuery.trim()
+                    templateSearchQuery.trim()
                       ? `匹配 ${matchedThemeTemplates.length}/${themeTemplates.length} 个模板`
                       : themeTemplates.length > 0
                         ? `共 ${themeTemplates.length} 个 templates/*.json`
                         : undefined
                   }
                   onFocus={() => {
-                    if (themeTemplates.length > 0) setTemplateMenuOpen(true);
+                    if (themeTemplates.length === 0) return;
+                    setTemplateQuery("");
+                    setTemplateMenuOpen(true);
                   }}
                   onInput={(event) => onTemplateQueryInput(event.currentTarget.value)}
                   onChange={(event) => onTemplateQueryInput(event.currentTarget.value)}
